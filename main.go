@@ -16,6 +16,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -60,6 +61,7 @@ func run() error {
 		audit  = flag.Bool("audit", false, "check every reference in every store, reporting dangling ones")
 		maxRep = flag.Int("max-report", 20, "with -audit, dangling references to print per store")
 		list   = flag.Bool("list", false, "print each store's node key range")
+		store  = flag.String("store", "", "restrict -audit and -nodekey to one store")
 		decode = flag.String("decode", "", "decode one node value, hex as printed by `pebble find`; needs no -db")
 	)
 	flag.Usage = usage
@@ -96,6 +98,12 @@ func run() error {
 		return fmt.Errorf("enumerate stores: %w", err)
 	}
 	fmt.Printf("%d stores: %s\n\n", len(names), strings.Join(names, " "))
+	if *store != "" {
+		if !slices.Contains(names, *store) {
+			return fmt.Errorf("no store named %q", *store)
+		}
+		names = []string{*store}
+	}
 
 	switch {
 	case *list:
@@ -152,24 +160,31 @@ func decodeNodeKey(b []byte) nodeKey {
 // nodePrefix is the key prefix under which one store's nodes live.
 func nodePrefix(store string) []byte { return []byte(rootPrefix + store + "/" + string(nodeTag)) }
 
-// eachNode calls fn for every node of one store, in key order. The value is
-// only valid during the call.
-func eachNode(db *pebble.DB, store string, fn func(nodeKey, []byte) error) error {
+// eachNode calls fn for every node of one store from key `from` on, in key
+// order. The value is only valid during the call.
+func eachNode(db *pebble.DB, store string, from nodeKey, fn func(nodeKey, []byte) error) error {
 	prefix := nodePrefix(store)
-	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound(prefix)})
+	it, err := db.NewIter(&pebble.IterOptions{
+		LowerBound: append(nodePrefix(store), from.bytes()...),
+		UpperBound: upperBound(prefix),
+	})
 	if err != nil {
 		return err
 	}
 	defer it.Close()
 
+	// A mainnet store takes hours, so report the rate every so often.
 	var seen int
+	start, last := time.Now(), time.Now()
 	for ok := it.First(); ok; ok = it.Next() {
 		k := it.Key()
 		if len(k) != len(prefix)+nodeKeyLen {
 			continue
 		}
-		if seen++; seen%20_000_000 == 0 {
-			fmt.Printf("  ... %dM nodes into %s\n", seen/1_000_000, store)
+		if seen++; seen%1_000_000 == 0 && time.Since(last) >= 30*time.Second {
+			fmt.Printf("  ... %s: %dM nodes, %.0fk nodes/s\n", store, seen/1_000_000,
+				float64(seen)/time.Since(start).Seconds()/1000)
+			last = time.Now()
 		}
 		if err := fn(decodeNodeKey(k[len(prefix):]), it.Value()); err != nil {
 			return err
@@ -182,9 +197,9 @@ func eachNode(db *pebble.DB, store string, fn func(nodeKey, []byte) error) error
 // nodes: two children per inner node, one pointer per reference root. Legacy
 // children are addressed by hash and skipped. treeKey is only valid during
 // the call.
-func eachRef(db *pebble.DB, store string, fn func(parent nodeKey, r reference, treeKey []byte) error) error {
+func eachRef(db *pebble.DB, store string, from nodeKey, fn func(parent nodeKey, r reference, treeKey []byte) error) error {
 	buf := make([]reference, 0, 2)
-	return eachNode(db, store, func(parent nodeKey, val []byte) error {
+	return eachNode(db, store, from, func(parent nodeKey, val []byte) error {
 		n, ok := decodeNode(val)
 		if !ok {
 			return nil
@@ -267,7 +282,10 @@ func findParents(db *pebble.DB, names []string, target nodeKey) error {
 	fmt.Printf("== references to %v ==\n", target)
 	var scanned, hits int
 	for _, name := range names {
-		err := eachRef(db, name, func(parent nodeKey, r reference, treeKey []byte) error {
+		// A parent is never older than its child, so nothing before the
+		// target's version can reference it.
+		from := nodeKey{version: target.version}
+		err := eachRef(db, name, from, func(parent nodeKey, r reference, treeKey []byte) error {
 			scanned++
 			if r.nk == target {
 				fmt.Printf("  %s: %s %s %s; tree key=%s\n", name, parent, r.side, target, describe(treeKey))
@@ -360,7 +378,7 @@ func auditStore(db *pebble.DB, store string) (nodes int, found []dangling, refs 
 		}
 		pending = pending[:0]
 	}
-	err = eachNode(db, store, func(parent nodeKey, val []byte) error {
+	err = eachNode(db, store, nodeKey{}, func(parent nodeKey, val []byte) error {
 		if parent.version != version {
 			flush()
 			version = parent.version

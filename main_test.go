@@ -140,7 +140,7 @@ func TestDecodeRebuildsTree(t *testing.T) {
 
 	refs := map[nodeKey]int{}
 	nodes := map[nodeKey]bool{}
-	err := eachNode(db, "evm", func(nk nodeKey, val []byte) error {
+	err := eachNode(db, "evm", nodeKey{}, func(nk nodeKey, val []byte) error {
 		nodes[nk] = true
 		n, ok := decodeNode(val)
 		if !ok {
@@ -260,7 +260,7 @@ func TestDecodeValueLeaf(t *testing.T) {
 	db, _ := openFixture(t, dir)
 
 	var leaves int
-	err := eachNode(db, "evm", func(_ nodeKey, val []byte) error {
+	err := eachNode(db, "evm", nodeKey{}, func(_ nodeKey, val []byte) error {
 		n, ok := decodeNode(val)
 		if !ok || !n.leaf {
 			return nil
@@ -447,7 +447,7 @@ func TestAuditMultiVersion(t *testing.T) {
 	// since an unchanged old node is referenced again by every later version.
 	var older, same nodeKey
 	count := map[nodeKey]int{}
-	err := eachRef(db, "evm", func(parent nodeKey, r reference, _ []byte) error {
+	err := eachRef(db, "evm", nodeKey{}, func(parent nodeKey, r reference, _ []byte) error {
 		count[r.nk]++
 		switch {
 		case r.nk.version < parent.version && older == (nodeKey{}):
@@ -465,6 +465,17 @@ func TestAuditMultiVersion(t *testing.T) {
 	}
 	if older == (nodeKey{}) || same == (nodeKey{}) || older == same {
 		t.Fatalf("fixture lacks both reference kinds: older=%v same=%v", older, same)
+	}
+
+	// findParents starts its scan at the target's version; it must still see
+	// every parent, which all live at that version or later.
+	out = captureStdout(t, func() {
+		if err := findParents(db, names, older); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if want := fmt.Sprintf("%d to %v", count[older], older); !strings.Contains(out, want) {
+		t.Fatalf("output missing %q:\n%s", want, out)
 	}
 
 	damaged := t.TempDir()

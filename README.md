@@ -19,6 +19,8 @@ iavlscan -db ~/.mantrachain/data/application.db -list                # node key 
 iavlscan -decode "[0c421501f18296...0242]"                           # one node value, no database
 ```
 
+`-store evm` restricts `-audit` and `-nodekey` to one store.
+
 The node must be stopped: pebble locks the directory even in read-only mode.
 Point `-db` at a snapshot or a copy otherwise. `-audit` and `-nodekey` read
 every node once and are disk bound, so on a mainnet database expect hours;
