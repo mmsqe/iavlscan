@@ -54,7 +54,37 @@ func buildFixture(t *testing.T, dir string, damage ...nodeKey) {
 	}
 }
 
-func openFixture(t *testing.T, dir string) (*pebble.DB, []string) {
+// buildVersioned writes one evm store that grew over many versions, the way
+// a real chain's does: each version updates `updates` keys out of `keyspace`.
+func buildVersioned(t testing.TB, dir string, versions, updates, keyspace int, damage ...nodeKey) {
+	t.Helper()
+	db, err := dbm.NewPebbleDB("application", dir, nil)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	pdb := dbm.NewPrefixDB(db, []byte(rootPrefix+"evm/"))
+	tree := iavl.NewMutableTree(iavldb.NewWrapper(pdb), 0, false, iavl.NewNopLogger())
+	for v := range versions {
+		for i := range updates {
+			k := fmt.Sprintf("key%06d", (v*7919+i*104729)%keyspace)
+			if _, err := tree.Set([]byte(k), []byte{byte(v), byte(i)}); err != nil {
+				t.Fatalf("set: %v", err)
+			}
+		}
+		if _, _, err := tree.SaveVersion(); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+	}
+	for _, nk := range damage {
+		if err := db.DeleteSync(append(nodePrefix("evm"), nk.bytes()...)); err != nil {
+			t.Fatalf("damage %v: %v", nk, err)
+		}
+	}
+}
+
+func openFixture(t testing.TB, dir string) (*pebble.DB, []string) {
 	t.Helper()
 	db, err := pebble.Open(filepath.Join(dir, "application.db"), &pebble.Options{ReadOnly: true})
 	if err != nil {
@@ -119,7 +149,7 @@ func TestDecodeRebuildsTree(t *testing.T) {
 		if n.trailing != 0 {
 			t.Fatalf("node %v left %d trailing bytes", nk, n.trailing)
 		}
-		for _, r := range n.outgoing() {
+		for _, r := range n.outgoing(nil) {
 			refs[r.nk]++
 		}
 		return nil
@@ -393,6 +423,67 @@ func TestAuditFindsDamage(t *testing.T) {
 	}
 }
 
+// TestAuditMultiVersion exercises the single pass on a tree that grew over
+// many versions: references to older versions resolve as they are met, and
+// same-version references wait for the version to end. One node of each kind
+// is then removed and both must be reported.
+func TestAuditMultiVersion(t *testing.T) {
+	const versions, updates, keyspace = 40, 25, 500
+
+	clean := t.TempDir()
+	buildVersioned(t, clean, versions, updates, keyspace)
+	db, names := openFixture(t, clean)
+
+	out := captureStdout(t, func() {
+		if err := auditAll(db, names, 20); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "0 dangling") {
+		t.Fatalf("clean tree audited dirty:\n%s", out)
+	}
+
+	// Pick one child of each kind and count how many parents reference each,
+	// since an unchanged old node is referenced again by every later version.
+	var older, same nodeKey
+	count := map[nodeKey]int{}
+	err := eachRef(db, "evm", func(parent nodeKey, r reference, _ []byte) error {
+		count[r.nk]++
+		switch {
+		case r.nk.version < parent.version && older == (nodeKey{}):
+			older = r.nk
+		case r.nk.version == parent.version && same == (nodeKey{}):
+			if r.nk.nonce <= parent.nonce {
+				t.Fatalf("%v references same-version %v with a lower nonce; the single pass relies on pre-order nonces", parent, r.nk)
+			}
+			same = r.nk
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if older == (nodeKey{}) || same == (nodeKey{}) || older == same {
+		t.Fatalf("fixture lacks both reference kinds: older=%v same=%v", older, same)
+	}
+
+	damaged := t.TempDir()
+	buildVersioned(t, damaged, versions, updates, keyspace, older, same)
+	db, names = openFixture(t, damaged)
+
+	out = captureStdout(t, func() {
+		if err := auditAll(db, names, 1000); err != nil {
+			t.Fatal(err)
+		}
+	})
+	want := fmt.Sprintf("%d dangling, 2 distinct missing node(s), 1 store(s) affected", count[older]+count[same])
+	for _, w := range []string{want, older.String() + " is missing", same.String() + " is missing"} {
+		if !strings.Contains(out, w) {
+			t.Fatalf("output missing %q:\n%s", w, out)
+		}
+	}
+}
+
 // TestAuditMaxReport checks that truncation is stated rather than silent.
 func TestAuditMaxReport(t *testing.T) {
 	dir := t.TempDir()
@@ -411,7 +502,7 @@ func TestAuditMaxReport(t *testing.T) {
 	}
 }
 
-func captureStdout(t *testing.T, fn func()) string {
+func captureStdout(t testing.TB, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {

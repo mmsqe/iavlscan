@@ -20,7 +20,9 @@ iavlscan -decode "[0c421501f18296...0242]"                           # one node 
 ```
 
 The node must be stopped: pebble locks the directory even in read-only mode.
-Point `-db` at a snapshot or a copy otherwise.
+Point `-db` at a snapshot or a copy otherwise. `-audit` and `-nodekey` read
+every node once and are disk bound, so on a mainnet database expect hours;
+`-audit` also holds 8 bytes of memory per node of the largest store.
 
 `-audit` is the one to start with:
 

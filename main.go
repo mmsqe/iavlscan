@@ -162,10 +162,14 @@ func eachNode(db *pebble.DB, store string, fn func(nodeKey, []byte) error) error
 	}
 	defer it.Close()
 
+	var seen int
 	for ok := it.First(); ok; ok = it.Next() {
 		k := it.Key()
 		if len(k) != len(prefix)+nodeKeyLen {
 			continue
+		}
+		if seen++; seen%20_000_000 == 0 {
+			fmt.Printf("  ... %dM nodes into %s\n", seen/1_000_000, store)
 		}
 		if err := fn(decodeNodeKey(k[len(prefix):]), it.Value()); err != nil {
 			return err
@@ -179,12 +183,13 @@ func eachNode(db *pebble.DB, store string, fn func(nodeKey, []byte) error) error
 // children are addressed by hash and skipped. treeKey is only valid during
 // the call.
 func eachRef(db *pebble.DB, store string, fn func(parent nodeKey, r reference, treeKey []byte) error) error {
+	buf := make([]reference, 0, 2)
 	return eachNode(db, store, func(parent nodeKey, val []byte) error {
 		n, ok := decodeNode(val)
 		if !ok {
 			return nil
 		}
-		for _, r := range n.outgoing() {
+		for _, r := range n.outgoing(buf) {
 			if r.legacy {
 				continue
 			}
@@ -264,9 +269,6 @@ func findParents(db *pebble.DB, names []string, target nodeKey) error {
 	for _, name := range names {
 		err := eachRef(db, name, func(parent nodeKey, r reference, treeKey []byte) error {
 			scanned++
-			if scanned%20_000_000 == 0 {
-				fmt.Printf("  ... %d references scanned (in %s)\n", scanned, name)
-			}
 			if r.nk == target {
 				fmt.Printf("  %s: %s %s %s; tree key=%s\n", name, parent, r.side, target, describe(treeKey))
 				hits++
@@ -287,17 +289,14 @@ func findParents(db *pebble.DB, names []string, target nodeKey) error {
 
 // dangling is one reference to a node that is not in the database.
 type dangling struct {
-	parent  nodeKey
-	ref     reference
-	treeKey []byte
+	parent nodeKey
+	ref    reference
 }
 
 // auditAll checks every reference in every store, so the damage can be read as
-// isolated (one bad prune decision) or widespread (bulk loss).
-//
-// Two passes per store: the first packs each node key into a uint64, and the
-// second binary-searches that array for every reference. Memory is 8 bytes
-// per node of the largest store, not of the whole database.
+// isolated (one bad prune decision) or widespread (bulk loss). It is disk
+// bound: one pass over every node, and 8 bytes of memory per node of the
+// largest store.
 func auditAll(db *pebble.DB, names []string, maxReport int) error {
 	var (
 		totalRefs, totalDangling int
@@ -305,17 +304,13 @@ func auditAll(db *pebble.DB, names []string, maxReport int) error {
 		hitStores                []string
 	)
 	for _, name := range names {
-		keys, err := loadNodeKeys(db, name)
-		if err != nil {
-			return fmt.Errorf("index store %s: %w", name, err)
-		}
-		found, refs, err := auditStore(db, name, keys)
+		nodes, found, refs, err := auditStore(db, name)
 		if err != nil {
 			return fmt.Errorf("audit store %s: %w", name, err)
 		}
 		totalRefs += refs
 		totalDangling += len(found)
-		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%d\n", name, len(keys), refs, len(found))
+		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%d\n", name, nodes, refs, len(found))
 		if len(found) == 0 {
 			continue
 		}
@@ -324,7 +319,7 @@ func auditAll(db *pebble.DB, names []string, maxReport int) error {
 			missing[d.ref.nk] = true
 		}
 		for _, d := range found[:min(len(found), maxReport)] {
-			fmt.Printf("      %s %s %s is missing; tree key=%s\n", d.parent, d.ref.side, d.ref.nk, describe(d.treeKey))
+			fmt.Printf("      %s %s %s is missing; tree key=%s\n", d.parent, d.ref.side, d.ref.nk, treeKeyOf(db, name, d.parent))
 		}
 		if len(found) > maxReport {
 			fmt.Printf("      ... and %d more not printed (raise -max-report to see them)\n", len(found)-maxReport)
@@ -341,31 +336,75 @@ func auditAll(db *pebble.DB, names []string, maxReport int) error {
 	return nil
 }
 
-// loadNodeKeys packs every node key of one store into a uint64 array. Pebble
-// yields keys in byte order, and both fields are big-endian, so the array
-// comes out sorted.
-func loadNodeKeys(db *pebble.DB, store string) ([]uint64, error) {
-	var keys []uint64
-	err := eachNode(db, store, func(nk nodeKey, _ []byte) error {
-		packed, ok := packNodeKey(nk)
+// auditStore checks every reference of one store in a single pass, packing
+// node keys into a sorted array as it goes (pebble yields them in order, and
+// both fields are big-endian).
+//
+// A child is created no later than its parent, and within one version parents
+// take lower nonces than children (saveNewNodes assigns them pre-order). So in
+// key order a reference to an older version always finds its node already in
+// the array, and a same-version reference only has to wait until the version
+// ends. Nothing needs a second pass.
+func auditStore(db *pebble.DB, store string) (nodes int, found []dangling, refs int, err error) {
+	var (
+		keys    []uint64
+		buf     = make([]reference, 0, 2)
+		pending []dangling // same-version references, checked once the version is complete
+		version int64
+	)
+	flush := func() {
+		for _, d := range pending {
+			if !resolves(keys, d.ref.nk) {
+				found = append(found, d)
+			}
+		}
+		pending = pending[:0]
+	}
+	err = eachNode(db, store, func(parent nodeKey, val []byte) error {
+		if parent.version != version {
+			flush()
+			version = parent.version
+		}
+		packed, ok := packNodeKey(parent)
 		if !ok {
-			return fmt.Errorf("node key %v does not fit the packed form", nk)
+			return fmt.Errorf("node key %v does not fit the packed form", parent)
 		}
 		keys = append(keys, packed)
-		return nil
-	})
-	return keys, err
-}
 
-func auditStore(db *pebble.DB, store string, keys []uint64) (found []dangling, refs int, err error) {
-	err = eachRef(db, store, func(parent nodeKey, r reference, treeKey []byte) error {
-		refs++
-		if !resolves(keys, r.nk) {
-			found = append(found, dangling{parent, r, bytes.Clone(treeKey)})
+		n, ok := decodeNode(val)
+		if !ok {
+			return nil
+		}
+		for _, r := range n.outgoing(buf) {
+			if r.legacy {
+				continue
+			}
+			refs++
+			d := dangling{parent: parent, ref: r}
+			switch {
+			case r.nk.version >= parent.version:
+				pending = append(pending, d)
+			case !resolves(keys, r.nk):
+				found = append(found, d)
+			}
 		}
 		return nil
 	})
-	return found, refs, err
+	flush()
+	return len(keys), found, refs, err
+}
+
+// treeKeyOf fetches one node's tree key for a report; "?" if it cannot.
+func treeKeyOf(db *pebble.DB, store string, nk nodeKey) string {
+	val, closer, err := db.Get(append(nodePrefix(store), nk.bytes()...))
+	if err != nil {
+		return "?"
+	}
+	defer closer.Close()
+	if n, ok := decodeNode(val); ok {
+		return describe(n.key)
+	}
+	return "?"
 }
 
 // resolves reports whether a reference finds a node, mirroring nodeDB.GetNode:
@@ -483,17 +522,17 @@ type node struct {
 	trailing    int     // bytes left over; non-zero means the decode is suspect
 }
 
-// outgoing lists the links this record holds: two children for an inner node,
-// one pointer for a reference root, none otherwise.
-func (n node) outgoing() []reference {
+// outgoing lists the links this record holds into buf: two children for an
+// inner node, one pointer for a reference root, none otherwise.
+func (n node) outgoing(buf []reference) []reference {
+	buf = buf[:0]
 	switch {
-	case n.leaf || n.empty:
-		return nil
 	case n.ref:
-		return []reference{{child: child{nk: n.refTo}, side: "reference to"}}
-	default:
-		return []reference{{child: n.left, side: "left child"}, {child: n.right, side: "right child"}}
+		buf = append(buf, reference{child{nk: n.refTo}, "reference to"})
+	case !n.leaf && !n.empty:
+		buf = append(buf, reference{n.left, "left child"}, reference{n.right, "right child"})
 	}
+	return buf
 }
 
 // decodeNode mirrors iavl.MakeNode: varint height, varint size, bytes key,
