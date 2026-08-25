@@ -1,0 +1,618 @@
+// iavlscan finds which IAVL store owns a node missing from a cosmos-sdk
+// application.db, given the nodeKey from a "Value missing for key" error.
+// The node is gone, so it looks for the parents that still reference it.
+//
+// Keys are s/k:<store>/s<version:8be><nonce:4be>. Parents hold children as
+// varints, not raw keys, so nodes have to be decoded to find one.
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"math"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/cockroachdb/pebble"
+)
+
+const (
+	rootPrefix = "s/k:" // every store lives under rootPrefix + name + "/"
+	nodeTag    = 's'    // then nodes under one more byte, then 12 bytes of key
+	nodeKeyLen = 12
+)
+
+// nodeKey identifies one IAVL node: the version that created it and its
+// sequence within that version.
+type nodeKey struct {
+	version int64
+	nonce   int32
+}
+
+func (nk nodeKey) String() string { return fmt.Sprintf("(v%d,n%d)", nk.version, nk.nonce) }
+
+// bytes returns the 12 bytes as stored.
+func (nk nodeKey) bytes() []byte {
+	b := binary.BigEndian.AppendUint64(nil, uint64(nk.version)) //nolint:gosec // round-trips the stored encoding
+	return binary.BigEndian.AppendUint32(b, uint32(nk.nonce))   //nolint:gosec // round-trips the stored encoding
+}
+
+// find is a `pebble find` argument for this node, with the store left to fill.
+func (nk nodeKey) find() string {
+	return fmt.Sprintf("pebble find <db> hex:<s/k:STORE/>%x%x", nodeTag, nk.bytes())
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "iavlscan: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	var (
+		dbPath = flag.String("db", "", "path to application.db")
+		rawKey = flag.String("nodekey", "", "find the parents of this node; hex as printed in the error")
+		audit  = flag.Bool("audit", false, "check every reference in every store, reporting dangling ones")
+		maxRep = flag.Int("max-report", 20, "with -audit, dangling references to print per store")
+		list   = flag.Bool("list", false, "print each store's node key range")
+		decode = flag.String("decode", "", "decode one node value, hex as printed by `pebble find`; needs no -db")
+	)
+	flag.Usage = usage
+	flag.Parse()
+
+	if *decode != "" {
+		return decodeValue(*decode)
+	}
+	var target nodeKey
+	if *rawKey != "" {
+		var err error
+		if target, err = parseNodeKey(*rawKey); err != nil {
+			return err
+		}
+	} else if !*list && !*audit {
+		flag.Usage()
+		return fmt.Errorf("one of -nodekey, -audit, -list or -decode is required")
+	}
+	if *dbPath == "" {
+		flag.Usage()
+		return fmt.Errorf("-db is required")
+	}
+
+	// ReadOnly still takes the directory LOCK, so the node has to be stopped,
+	// or this pointed at a snapshot or copy of the data dir.
+	db, err := pebble.Open(*dbPath, &pebble.Options{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("open %s: %w", *dbPath, err)
+	}
+	defer db.Close()
+
+	names, err := storeNames(db)
+	if err != nil {
+		return fmt.Errorf("enumerate stores: %w", err)
+	}
+	fmt.Printf("%d stores: %s\n\n", len(names), strings.Join(names, " "))
+
+	switch {
+	case *list:
+		return listRanges(db, names)
+	case *audit:
+		return auditAll(db, names, *maxRep)
+	default:
+		return findParents(db, names, target)
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `iavlscan finds the IAVL store that owns a missing node.
+
+usage:
+  iavlscan -db <application.db> -audit
+  iavlscan -db <application.db> -nodekey <hex>
+  iavlscan -db <application.db> -list
+  iavlscan -decode <hex>
+
+The node must be stopped: pebble locks the directory even in read-only mode.
+
+flags:
+`)
+	flag.PrintDefaults()
+}
+
+// parseNodeKey accepts the nodeKey as printed in the iavl error, with or
+// without the 's' tag and an optional 0x.
+func parseNodeKey(s string) (nodeKey, error) {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "0x")
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nodeKey{}, fmt.Errorf("parse nodekey %q: %w", s, err)
+	}
+	if len(b) == nodeKeyLen+1 && b[0] == nodeTag {
+		b = b[1:]
+	}
+	if len(b) != nodeKeyLen {
+		return nodeKey{}, fmt.Errorf("parse nodekey %q: want %d bytes (or one more with the 's' tag), got %d",
+			s, nodeKeyLen, len(b))
+	}
+	return decodeNodeKey(b), nil
+}
+
+// decodeNodeKey reads the 12 stored bytes of a node key.
+func decodeNodeKey(b []byte) nodeKey {
+	return nodeKey{
+		version: int64(binary.BigEndian.Uint64(b[:8])), //nolint:gosec // written as 8-byte BE int64
+		nonce:   int32(binary.BigEndian.Uint32(b[8:])), //nolint:gosec // written as 4-byte BE int32
+	}
+}
+
+// nodePrefix is the key prefix under which one store's nodes live.
+func nodePrefix(store string) []byte { return []byte(rootPrefix + store + "/" + string(nodeTag)) }
+
+// eachNode calls fn for every node of one store, in key order. The value is
+// only valid during the call.
+func eachNode(db *pebble.DB, store string, fn func(nodeKey, []byte) error) error {
+	prefix := nodePrefix(store)
+	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound(prefix)})
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+
+	for ok := it.First(); ok; ok = it.Next() {
+		k := it.Key()
+		if len(k) != len(prefix)+nodeKeyLen {
+			continue
+		}
+		if err := fn(decodeNodeKey(k[len(prefix):]), it.Value()); err != nil {
+			return err
+		}
+	}
+	return it.Error()
+}
+
+// eachRef calls fn for every (version, nonce) reference held by one store's
+// nodes: two children per inner node, one pointer per reference root. Legacy
+// children are addressed by hash and skipped. treeKey is only valid during
+// the call.
+func eachRef(db *pebble.DB, store string, fn func(parent nodeKey, r reference, treeKey []byte) error) error {
+	return eachNode(db, store, func(parent nodeKey, val []byte) error {
+		n, ok := decodeNode(val)
+		if !ok {
+			return nil
+		}
+		for _, r := range n.outgoing() {
+			if r.legacy {
+				continue
+			}
+			if err := fn(parent, r, n.key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// storeNames walks the s/k: range, skipping each store's contents once its
+// name is known ('/'+1 == '0'), so this costs one seek per store.
+func storeNames(db *pebble.DB) ([]string, error) {
+	prefix := []byte(rootPrefix)
+	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+
+	var out []string
+	for it.First(); it.Valid(); {
+		rest := it.Key()[len(prefix):]
+		i := bytes.IndexByte(rest, '/')
+		if i < 0 {
+			it.Next()
+			continue
+		}
+		name := string(rest[:i])
+		out = append(out, name)
+		it.SeekGE([]byte(rootPrefix + name + "0"))
+	}
+	return out, it.Error()
+}
+
+// listRanges prints the first and last node key of each store. Two seeks per
+// store, no scan.
+func listRanges(db *pebble.DB, names []string) error {
+	for _, name := range names {
+		prefix := nodePrefix(name)
+		it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound(prefix)})
+		if err != nil {
+			return err
+		}
+		first, ok := edgeNode(it, it.First, it.Next, len(prefix))
+		last, _ := edgeNode(it, it.Last, it.Prev, len(prefix))
+		err = it.Error()
+		it.Close()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Printf("  %-24s (no nodes)\n", name)
+			continue
+		}
+		fmt.Printf("  %-24s first=%-18v last=%v\n", name, first, last)
+	}
+	return nil
+}
+
+// edgeNode returns the first node key found from one end of the range.
+func edgeNode(it *pebble.Iterator, start, step func() bool, prefixLen int) (nodeKey, bool) {
+	for ok := start(); ok; ok = step() {
+		if k := it.Key(); len(k) == prefixLen+nodeKeyLen {
+			return decodeNodeKey(k[prefixLen:]), true
+		}
+	}
+	return nodeKey{}, false
+}
+
+// findParents prints every reference to the target. It does not check whether
+// the target exists, so it cannot say if they dangle; -audit does.
+func findParents(db *pebble.DB, names []string, target nodeKey) error {
+	fmt.Printf("== references to %v ==\n", target)
+	var scanned, hits int
+	for _, name := range names {
+		err := eachRef(db, name, func(parent nodeKey, r reference, treeKey []byte) error {
+			scanned++
+			if scanned%20_000_000 == 0 {
+				fmt.Printf("  ... %d references scanned (in %s)\n", scanned, name)
+			}
+			if r.nk == target {
+				fmt.Printf("  %s: %s %s %s; tree key=%s\n", name, parent, r.side, target, describe(treeKey))
+				hits++
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("scan store %s: %w", name, err)
+		}
+	}
+	fmt.Printf("\nscanned %d references, %d to %v\n", scanned, hits, target)
+	if hits == 0 {
+		fmt.Println("nothing references it: either pruning was right to remove it and the " +
+			"fault came from elsewhere, or this is not the database that produced the error.")
+	}
+	return nil
+}
+
+// dangling is one reference to a node that is not in the database.
+type dangling struct {
+	parent  nodeKey
+	ref     reference
+	treeKey []byte
+}
+
+// auditAll checks every reference in every store, so the damage can be read as
+// isolated (one bad prune decision) or widespread (bulk loss).
+//
+// Two passes per store: the first packs each node key into a uint64, and the
+// second binary-searches that array for every reference. Memory is 8 bytes
+// per node of the largest store, not of the whole database.
+func auditAll(db *pebble.DB, names []string, maxReport int) error {
+	var (
+		totalRefs, totalDangling int
+		missing                  = map[nodeKey]bool{}
+		hitStores                []string
+	)
+	for _, name := range names {
+		keys, err := loadNodeKeys(db, name)
+		if err != nil {
+			return fmt.Errorf("index store %s: %w", name, err)
+		}
+		found, refs, err := auditStore(db, name, keys)
+		if err != nil {
+			return fmt.Errorf("audit store %s: %w", name, err)
+		}
+		totalRefs += refs
+		totalDangling += len(found)
+		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%d\n", name, len(keys), refs, len(found))
+		if len(found) == 0 {
+			continue
+		}
+		hitStores = append(hitStores, name)
+		for _, d := range found {
+			missing[d.ref.nk] = true
+		}
+		for _, d := range found[:min(len(found), maxReport)] {
+			fmt.Printf("      %s %s %s is missing; tree key=%s\n", d.parent, d.ref.side, d.ref.nk, describe(d.treeKey))
+		}
+		if len(found) > maxReport {
+			fmt.Printf("      ... and %d more not printed (raise -max-report to see them)\n", len(found)-maxReport)
+		}
+	}
+
+	fmt.Printf("\nchecked %d references: %d dangling, %d distinct missing node(s), %d store(s) affected\n",
+		totalRefs, totalDangling, len(missing), len(hitStores))
+	if totalDangling == 0 {
+		fmt.Println("every reference resolves; this database is internally consistent")
+	} else {
+		fmt.Printf("affected stores: %s\n", strings.Join(hitStores, " "))
+	}
+	return nil
+}
+
+// loadNodeKeys packs every node key of one store into a uint64 array. Pebble
+// yields keys in byte order, and both fields are big-endian, so the array
+// comes out sorted.
+func loadNodeKeys(db *pebble.DB, store string) ([]uint64, error) {
+	var keys []uint64
+	err := eachNode(db, store, func(nk nodeKey, _ []byte) error {
+		packed, ok := packNodeKey(nk)
+		if !ok {
+			return fmt.Errorf("node key %v does not fit the packed form", nk)
+		}
+		keys = append(keys, packed)
+		return nil
+	})
+	return keys, err
+}
+
+func auditStore(db *pebble.DB, store string, keys []uint64) (found []dangling, refs int, err error) {
+	err = eachRef(db, store, func(parent nodeKey, r reference, treeKey []byte) error {
+		refs++
+		if !resolves(keys, r.nk) {
+			found = append(found, dangling{parent, r, bytes.Clone(treeKey)})
+		}
+		return nil
+	})
+	return found, refs, err
+}
+
+// resolves reports whether a reference finds a node, mirroring nodeDB.GetNode:
+// a missing key whose nonce is 1 falls back to (version, 0), the reformatted
+// root deleteVersion leaves behind. Without that fallback every pruned root
+// would look dangling.
+func resolves(keys []uint64, nk nodeKey) bool {
+	if has(keys, nk) {
+		return true
+	}
+	return nk.nonce == 1 && has(keys, nodeKey{version: nk.version})
+}
+
+func has(keys []uint64, nk nodeKey) bool {
+	packed, ok := packNodeKey(nk)
+	if !ok {
+		return false // nothing in the index can match an impossible key
+	}
+	_, found := slices.BinarySearch(keys, packed)
+	return found
+}
+
+// packNodeKey folds a node key into one uint64, preserving the stored order.
+// Both fields are written unsigned and big-endian, so this is lossless for any
+// version below 2^32 -- far above any real chain height.
+func packNodeKey(nk nodeKey) (uint64, bool) {
+	if nk.version < 0 || nk.version > math.MaxUint32 || nk.nonce < 0 {
+		return 0, false
+	}
+	return uint64(nk.version)<<32 | uint64(uint32(nk.nonce)), true //nolint:gosec // nonce is checked non-negative
+}
+
+// decodeValue prints one node value, taken from the [...] field of a
+// `pebble find` or `pebble sstable scan` line.
+func decodeValue(raw string) error {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(strings.TrimSuffix(raw, "]"), "[") // as pebble prints it
+	raw = strings.TrimPrefix(raw, "0x")
+	buf, err := hex.DecodeString(raw)
+	if err != nil {
+		return fmt.Errorf("parse value %q: %w", raw, err)
+	}
+	n, ok := decodeNode(buf)
+	if !ok {
+		return fmt.Errorf("not an iavl node value (%d bytes)", len(buf))
+	}
+
+	switch {
+	case n.empty:
+		fmt.Println("empty root: this version has no tree")
+		return nil
+	case n.ref:
+		fmt.Printf("reference root: this version's root is unchanged, so it points at %v\n", n.refTo)
+		fmt.Println(n.refTo.find())
+		return nil
+	}
+
+	kind := "inner"
+	if n.leaf {
+		kind = "leaf"
+	}
+	fmt.Printf("height    %d  (%s)\n", n.height, kind)
+	fmt.Printf("size      %d\n", n.size)
+	fmt.Printf("tree key  %s\n", describe(n.key))
+	if n.leaf {
+		fmt.Printf("value     %s\n", describe(n.value))
+	} else {
+		fmt.Printf("hash      %x\n", n.hash)
+		fmt.Printf("left      %s\n", n.left)
+		fmt.Printf("right     %s\n", n.right)
+	}
+	// iavl writes nothing after the last field, so leftovers mean the value was
+	// truncated, or was never an iavl node to begin with.
+	if n.trailing != 0 {
+		fmt.Printf("\nwarning: %d trailing byte(s) -- decode is suspect\n", n.trailing)
+	}
+	return nil
+}
+
+// child is one of an inner node's two links, either a node key or, for a node
+// carried over from the legacy format, a hash.
+type child struct {
+	nk     nodeKey
+	hash   []byte
+	legacy bool
+}
+
+func (c child) String() string {
+	if c.legacy {
+		return fmt.Sprintf("legacy hash %x", c.hash)
+	}
+	return fmt.Sprintf("%-16v %s", c.nk, c.nk.find())
+}
+
+// reference is one outgoing link, named by which side it came from.
+type reference struct {
+	child
+	side string
+}
+
+// node is one decoded IAVL record. Leaves carry key and value, inner nodes key,
+// hash and two children. Two shapes are not nodes at all: an empty root, and a
+// reference root, which points at an earlier version's root.
+type node struct {
+	height      int64
+	size        int64
+	key         []byte // the tree key, i.e. the store key this node sits under
+	leaf        bool
+	value       []byte // leaves only
+	hash        []byte // inner only
+	left, right child  // inner only
+	empty       bool
+	ref         bool
+	refTo       nodeKey // set when ref
+	trailing    int     // bytes left over; non-zero means the decode is suspect
+}
+
+// outgoing lists the links this record holds: two children for an inner node,
+// one pointer for a reference root, none otherwise.
+func (n node) outgoing() []reference {
+	switch {
+	case n.leaf || n.empty:
+		return nil
+	case n.ref:
+		return []reference{{child: child{nk: n.refTo}, side: "reference to"}}
+	default:
+		return []reference{{child: n.left, side: "left child"}, {child: n.right, side: "right child"}}
+	}
+}
+
+// decodeNode mirrors iavl.MakeNode: varint height, varint size, bytes key,
+// then for a leaf bytes value, and for an inner node bytes hash, varint mode
+// and per child either a legacy bytes(hash) or varint version + varint nonce.
+// It reports ok=false for anything it cannot parse.
+func decodeNode(buf []byte) (node, bool) {
+	var n node
+
+	// nodeDB.SaveEmptyRoot writes a zero-length value.
+	if len(buf) == 0 {
+		n.empty = true
+		return n, true
+	}
+	// nodeDB.isReferenceRoot: a value starting with the node tag points at an
+	// earlier version's root, written when nothing changed. It comes in two
+	// lengths, the shorter from before lazy pruning.
+	if buf[0] == nodeTag {
+		switch len(buf) {
+		case nodeKeyLen + 1: // 's' + version + nonce
+			n.ref, n.refTo = true, decodeNodeKey(buf[1:])
+		case 9: // 's' + version, with nonce 1 implied
+			n.ref, n.refTo = true, nodeKey{version: int64(binary.BigEndian.Uint64(buf[1:])), nonce: 1} //nolint:gosec // written as 8-byte BE int64
+		default:
+			return n, false
+		}
+		return n, true
+	}
+
+	height, adv := binary.Varint(buf)
+	if adv <= 0 {
+		return n, false
+	}
+	n.height, buf = height, buf[adv:]
+
+	size, adv := binary.Varint(buf)
+	if adv <= 0 {
+		return n, false
+	}
+	n.size, buf = size, buf[adv:]
+
+	var ok bool
+	if n.key, buf, ok = decodeBytes(buf); !ok {
+		return n, false
+	}
+
+	if n.height == 0 {
+		n.leaf = true
+		if n.value, buf, ok = decodeBytes(buf); !ok {
+			return n, false
+		}
+		n.trailing = len(buf)
+		return n, true
+	}
+
+	if n.hash, buf, ok = decodeBytes(buf); !ok {
+		return n, false
+	}
+	mode, adv := binary.Varint(buf)
+	if adv <= 0 || mode < 0 || mode > 3 {
+		return n, false
+	}
+	buf = buf[adv:]
+
+	// mode bit 0/1 mark a child still referenced by its legacy hash.
+	if n.left, buf, ok = decodeChild(buf, mode&0x01 != 0); !ok {
+		return n, false
+	}
+	if n.right, buf, ok = decodeChild(buf, mode&0x02 != 0); !ok {
+		return n, false
+	}
+	n.trailing = len(buf)
+	return n, true
+}
+
+func decodeChild(buf []byte, legacy bool) (child, []byte, bool) {
+	if legacy { // a 32-byte hash, carrying no (version, nonce)
+		hash, rest, ok := decodeBytes(buf)
+		return child{hash: hash, legacy: true}, rest, ok
+	}
+	version, adv := binary.Varint(buf)
+	if adv <= 0 {
+		return child{}, nil, false
+	}
+	buf = buf[adv:]
+	nonce, adv := binary.Varint(buf)
+	if adv <= 0 {
+		return child{}, nil, false
+	}
+	return child{nk: nodeKey{version: version, nonce: int32(nonce)}}, buf[adv:], true //nolint:gosec // nonce is an int32 in the encoding
+}
+
+func decodeBytes(buf []byte) (val, rest []byte, ok bool) {
+	l, n := binary.Uvarint(buf)
+	if n <= 0 || uint64(len(buf)-n) < l {
+		return nil, nil, false
+	}
+	return buf[n : n+int(l)], buf[n+int(l):], true
+}
+
+// upperBound is the exclusive end of a prefix range.
+func upperBound(prefix []byte) []byte {
+	ub := bytes.Clone(prefix)
+	for i := len(ub) - 1; i >= 0; i-- {
+		if ub[i] < 0xff {
+			ub[i]++
+			return ub[:i+1]
+		}
+	}
+	return nil
+}
+
+// describe renders a tree key or value as hex, adding the quoted text when it
+// is all printable.
+func describe(b []byte) string {
+	for _, c := range b {
+		if c < 0x20 || c > 0x7e {
+			return fmt.Sprintf("%x", b)
+		}
+	}
+	return fmt.Sprintf("%x (%q)", b, b)
+}
