@@ -218,6 +218,17 @@ func TestDecodeNodeReferenceRoot(t *testing.T) {
 		}
 	}
 
+	// Reports must say what a root is rather than show an empty tree key.
+	if got := where(node{ref: true, refTo: nodeKey{version: 7, nonce: 1}}); got != "reference root -> (v7,n1)" {
+		t.Fatalf("where(reference root) = %q", got)
+	}
+	if got := where(node{empty: true}); got != "empty root" {
+		t.Fatalf("where(empty root) = %q", got)
+	}
+	if got := where(node{key: []byte("params")}); got != "tree key=706172616d73 (\"params\")" {
+		t.Fatalf("where(node) = %q", got)
+	}
+
 	// SaveEmptyRoot writes nothing at all.
 	if n, ok := decodeNode(nil); !ok || !n.empty || n.ref {
 		t.Fatalf("empty value: got ok=%v empty=%v ref=%v", ok, n.empty, n.ref)
@@ -301,7 +312,7 @@ func TestFindParents(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	for _, want := range []string{"  evm: ", "  bank: ", "2 to (v1,n7)"} {
+	for _, want := range []string{"present in bank", "present in evm", "  evm: ", "  bank: ", "2 to (v1,n7), 0 dangling"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
@@ -313,7 +324,7 @@ func TestFindParents(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if want := "0 to (v1,n1)"; !strings.Contains(out, want) {
+	if want := "0 to (v1,n1), 0 dangling"; !strings.Contains(out, want) {
 		t.Fatalf("output missing %q:\n%s", want, out)
 	}
 }
@@ -421,6 +432,21 @@ func TestAuditFindsDamage(t *testing.T) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
 	}
+
+	// The targeted scan must reach the same verdict per store.
+	out = captureStdout(t, func() {
+		if err := findParents(db, names, nodeKey{version: 1, nonce: 7}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, want := range []string{"present in bank", "(v1,n7) (dangling)", "2 to (v1,n7), 1 dangling"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "present in evm") {
+		t.Fatalf("deleted node reported present in evm:\n%s", out)
+	}
 }
 
 // TestAuditMultiVersion exercises the single pass on a tree that grew over
@@ -447,7 +473,7 @@ func TestAuditMultiVersion(t *testing.T) {
 	// since an unchanged old node is referenced again by every later version.
 	var older, same nodeKey
 	count := map[nodeKey]int{}
-	err := eachRef(db, "evm", nodeKey{}, func(parent nodeKey, r reference, _ []byte) error {
+	err := eachRef(db, "evm", nodeKey{}, func(parent nodeKey, r reference, _ node) error {
 		count[r.nk]++
 		switch {
 		case r.nk.version < parent.version && older == (nodeKey{}):

@@ -195,9 +195,9 @@ func eachNode(db *pebble.DB, store string, from nodeKey, fn func(nodeKey, []byte
 
 // eachRef calls fn for every (version, nonce) reference held by one store's
 // nodes: two children per inner node, one pointer per reference root. Legacy
-// children are addressed by hash and skipped. treeKey is only valid during
-// the call.
-func eachRef(db *pebble.DB, store string, from nodeKey, fn func(parent nodeKey, r reference, treeKey []byte) error) error {
+// children are addressed by hash and skipped. The parent node's slices are
+// only valid during the call.
+func eachRef(db *pebble.DB, store string, from nodeKey, fn func(parent nodeKey, r reference, n node) error) error {
 	buf := make([]reference, 0, 2)
 	return eachNode(db, store, from, func(parent nodeKey, val []byte) error {
 		n, ok := decodeNode(val)
@@ -208,7 +208,7 @@ func eachRef(db *pebble.DB, store string, from nodeKey, fn func(parent nodeKey, 
 			if r.legacy {
 				continue
 			}
-			if err := fn(parent, r, n.key); err != nil {
+			if err := fn(parent, r, n); err != nil {
 				return err
 			}
 		}
@@ -276,28 +276,46 @@ func edgeNode(it *pebble.Iterator, start, step func() bool, prefixLen int) (node
 	return nodeKey{}, false
 }
 
-// findParents prints every reference to the target. It does not check whether
-// the target exists, so it cannot say if they dangle; -audit does.
+// findParents answers two questions about the target: is it in any store, and
+// who references it. A reference from a store the target is absent from is
+// dangling.
 func findParents(db *pebble.DB, names []string, target nodeKey) error {
-	fmt.Printf("== references to %v ==\n", target)
-	var scanned, hits int
+	present := map[string]bool{}
+	for _, name := range names {
+		if n, ok := getNode(db, name, target); ok {
+			present[name] = true
+			fmt.Printf("%v is present in %s, %s\n", target, name, where(n))
+		}
+	}
+	if len(present) == 0 {
+		fmt.Printf("%v is present in no store\n", target)
+	}
+
+	fmt.Printf("\n== references to %v ==\n", target)
+	var scanned, hits, dangling int
 	for _, name := range names {
 		// A parent is never older than its child, so nothing before the
 		// target's version can reference it.
 		from := nodeKey{version: target.version}
-		err := eachRef(db, name, from, func(parent nodeKey, r reference, treeKey []byte) error {
+		err := eachRef(db, name, from, func(parent nodeKey, r reference, n node) error {
 			scanned++
-			if r.nk == target {
-				fmt.Printf("  %s: %s %s %s; tree key=%s\n", name, parent, r.side, target, describe(treeKey))
-				hits++
+			if r.nk != target {
+				return nil
 			}
+			hits++
+			note := ""
+			if !present[name] {
+				dangling++
+				note = " (dangling)"
+			}
+			fmt.Printf("  %s: %s %s %s%s; %s\n", name, parent, r.side, target, note, where(n))
 			return nil
 		})
 		if err != nil {
 			return fmt.Errorf("scan store %s: %w", name, err)
 		}
 	}
-	fmt.Printf("\nscanned %d references, %d to %v\n", scanned, hits, target)
+	fmt.Printf("\nscanned %d references, %d to %v, %d dangling\n", scanned, hits, target, dangling)
 	if hits == 0 {
 		fmt.Println("nothing references it: either pruning was right to remove it and the " +
 			"fault came from elsewhere, or this is not the database that produced the error.")
@@ -337,7 +355,7 @@ func auditAll(db *pebble.DB, names []string, maxReport int) error {
 			missing[d.ref.nk] = true
 		}
 		for _, d := range found[:min(len(found), maxReport)] {
-			fmt.Printf("      %s %s %s is missing; tree key=%s\n", d.parent, d.ref.side, d.ref.nk, treeKeyOf(db, name, d.parent))
+			fmt.Printf("      %s %s %s is missing; %s\n", d.parent, d.ref.side, d.ref.nk, whereOf(db, name, d.parent))
 		}
 		if len(found) > maxReport {
 			fmt.Printf("      ... and %d more not printed (raise -max-report to see them)\n", len(found)-maxReport)
@@ -412,17 +430,38 @@ func auditStore(db *pebble.DB, store string) (nodes int, found []dangling, refs 
 	return len(keys), found, refs, err
 }
 
-// treeKeyOf fetches one node's tree key for a report; "?" if it cannot.
-func treeKeyOf(db *pebble.DB, store string, nk nodeKey) string {
+// getNode fetches and decodes one node, with nodeDB.GetNode's fallback from a
+// missing (v,1) to the reformatted root (v,0).
+func getNode(db *pebble.DB, store string, nk nodeKey) (node, bool) {
 	val, closer, err := db.Get(append(nodePrefix(store), nk.bytes()...))
+	if err != nil && nk.nonce == 1 {
+		return getNode(db, store, nodeKey{version: nk.version})
+	}
 	if err != nil {
-		return "?"
+		return node{}, false
 	}
 	defer closer.Close()
-	if n, ok := decodeNode(val); ok {
-		return describe(n.key)
+	return decodeNode(val)
+}
+
+// whereOf is where(getNode(...)) for a report, "?" if the node cannot be read.
+func whereOf(db *pebble.DB, store string, nk nodeKey) string {
+	if n, ok := getNode(db, store, nk); ok {
+		return where(n)
 	}
 	return "?"
+}
+
+// where places a record for a report: the tree key it sits under, or the kind
+// of root it is when it has none.
+func where(n node) string {
+	switch {
+	case n.ref:
+		return fmt.Sprintf("reference root -> %v", n.refTo)
+	case n.empty:
+		return "empty root"
+	}
+	return "tree key=" + describe(n.key)
 }
 
 // resolves reports whether a reference finds a node, mirroring nodeDB.GetNode:

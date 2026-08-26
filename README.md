@@ -14,7 +14,7 @@ iavlscan works backwards from the parents that still point at it.
 go build -o iavlscan .
 
 iavlscan -db ~/.mantrachain/data/application.db -audit               # every dangling reference
-iavlscan -db ~/.mantrachain/data/application.db -nodekey 7300...f2   # parents of one node
+iavlscan -db ~/.mantrachain/data/application.db -nodekey 7300...f2   # is one node present, and who references it
 iavlscan -db ~/.mantrachain/data/application.db -list                # node key range per store
 iavlscan -decode "[0c421501f18296...0242]"                           # one node value, no database
 ```
