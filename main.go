@@ -67,6 +67,8 @@ func run() error {
 		store  = flag.String("store", "", "restrict -audit and -nodekey to one store, and read -decode's tree key under it")
 		decode = flag.String("decode", "", "decode one node value, hex as printed by `pebble find`; needs no -db")
 		noLock = flag.Bool("no-lock", false, "skip the directory lock, to read a database a running node holds open")
+		treeK  = flag.String("treekey", "", "walk -store's latest tree down to this tree key (hex), printing the path a write takes")
+		del    = flag.String("delete", "", "delete this node (hex nodeKey) from -store to simulate damage; irreversible, the node must be stopped")
 		hrp    = flag.String("bech32", "mantra", "account prefix for addresses in tree keys; empty prints them as hex")
 	)
 	flag.Usage = usage
@@ -82,13 +84,31 @@ func run() error {
 		if target, err = parseNodeKey(*rawKey); err != nil {
 			return err
 		}
-	} else if !*list && !*audit {
+	} else if !*list && !*audit && *treeK == "" && *del == "" {
 		flag.Usage()
-		return fmt.Errorf("one of -nodekey, -audit, -list or -decode is required")
+		return fmt.Errorf("one of -nodekey, -audit, -list, -treekey, -delete or -decode is required")
 	}
 	if *dbPath == "" {
 		flag.Usage()
 		return fmt.Errorf("-db is required")
+	}
+	if (*treeK != "" || *del != "") && *store == "" {
+		return fmt.Errorf("-treekey and -delete need -store")
+	}
+
+	// -delete is the one mode that writes; it opens read-write and so must
+	// hold the lock itself.
+	if *del != "" {
+		nk, err := parseNodeKey(*del)
+		if err != nil {
+			return err
+		}
+		db, err := pebble.Open(*dbPath, &pebble.Options{})
+		if err != nil {
+			return fmt.Errorf("open %s: %w", *dbPath, err)
+		}
+		defer db.Close()
+		return deleteNode(db, *store, nk)
 	}
 
 	// ReadOnly still takes the directory LOCK, so the node has to be stopped
@@ -120,9 +140,86 @@ func run() error {
 		return listRanges(db, names)
 	case *audit:
 		return auditAll(db, names, *maxRep)
+	case *treeK != "":
+		key, err := hex.DecodeString(strings.TrimPrefix(*treeK, "0x"))
+		if err != nil {
+			return fmt.Errorf("parse treekey: %w", err)
+		}
+		_, err = walkTo(db, *store, key)
+		return err
 	default:
 		return findParents(db, names, target)
 	}
+}
+
+// walkTo descends a store's latest tree to a tree key the way a Get or Set
+// does, printing each node on the way. A node missing from that path is the
+// one the next write to the key will fail on. Returns the leaf's node key.
+func walkTo(db *pebble.DB, store string, key []byte) (nodeKey, error) {
+	nk, ok := latestRoot(db, store)
+	if !ok {
+		return nodeKey{}, fmt.Errorf("%s has no nodes", store)
+	}
+	fmt.Printf("== %s: path to %x ==\n", store, key)
+	for {
+		n, ok := getNode(db, store, nk)
+		if !ok {
+			return nodeKey{}, fmt.Errorf("%s: %v is missing; a write to %x fails here", store, nk, key)
+		}
+		switch {
+		case n.ref: // an unchanged version points at an earlier root
+			nk = n.refTo
+			continue
+		case n.empty:
+			return nodeKey{}, fmt.Errorf("%s is empty at its latest version", store)
+		}
+		fmt.Printf("  %-18v %s\n", nk, where(store, n))
+		if n.leaf {
+			if !bytes.Equal(n.key, key) {
+				return nodeKey{}, fmt.Errorf("%x is not in %s; the walk ended at %v", key, store, nk)
+			}
+			fmt.Printf("leaf %v holds it: iavlscan -db <db> -store %s -delete %x%x\n", nk, store, nodeTag, nk.bytes())
+			return nk, nil
+		}
+		if n.left.legacy || n.right.legacy {
+			return nodeKey{}, fmt.Errorf("%v has a legacy child, which this walk cannot follow", nk)
+		}
+		// Inner keys are the smallest key of the right subtree.
+		if bytes.Compare(key, n.key) < 0 {
+			nk = n.left.nk
+		} else {
+			nk = n.right.nk
+		}
+	}
+}
+
+// latestRoot is the root key of the store's newest version: every version
+// writes a root record at nonce 1, so it is the highest version seen.
+func latestRoot(db *pebble.DB, store string) (nodeKey, bool) {
+	prefix := nodePrefix(store)
+	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound(prefix)})
+	if err != nil {
+		return nodeKey{}, false
+	}
+	defer it.Close()
+	last, ok := edgeNode(it, it.Last, it.Prev, len(prefix))
+	return nodeKey{version: last.version, nonce: 1}, ok
+}
+
+// deleteNode removes one node, the way a bad prune would, so the failure a
+// damaged node produces can be reproduced on purpose.
+func deleteNode(db *pebble.DB, store string, nk nodeKey) error {
+	key := append(nodePrefix(store), nk.bytes()...)
+	if _, closer, err := db.Get(key); err != nil {
+		return fmt.Errorf("%s has no node %v: %w", store, nk, err)
+	} else {
+		closer.Close()
+	}
+	if err := db.Delete(key, pebble.Sync); err != nil {
+		return err
+	}
+	fmt.Printf("deleted %s %v\n", store, nk)
+	return nil
 }
 
 func usage() {
@@ -132,6 +229,8 @@ usage:
   iavlscan -db <application.db> -audit
   iavlscan -db <application.db> -nodekey <hex>
   iavlscan -db <application.db> -list
+  iavlscan -db <application.db> -store <name> -treekey <hex>
+  iavlscan -db <application.db> -store <name> -delete <hex>   (simulates damage)
   iavlscan -decode <hex> [-store <name>]
 
 The node must be stopped: pebble locks the directory even in read-only mode.

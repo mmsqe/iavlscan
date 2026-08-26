@@ -17,7 +17,15 @@ iavlscan -db ~/.mantrachain/data/application.db -audit               # every dan
 iavlscan -db ~/.mantrachain/data/application.db -nodekey 7300...f2   # is one node present, and who references it
 iavlscan -db ~/.mantrachain/data/application.db -list                # node key range per store
 iavlscan -decode "[0c421501f18296...0242]"                           # one node value, no database
+
+iavlscan -db … -store bank -treekey 0214a6fd…616d616e747261            # the path a write to that key takes
+iavlscan -db … -store bank -delete 7300000000000000030000001f          # delete a node to simulate damage
 ```
+
+`-treekey` walks the latest tree to a key the way `Set` does, so a node missing
+on that path is the one the next write fails on; its last line is the
+`-delete` command for the leaf. `-delete` exists to reproduce the fault in a
+test — it is irreversible and opens the database read-write.
 
 `-store evm` restricts `-audit` and `-nodekey` to one store, and tells `-decode`
 which layout to read its tree key under.

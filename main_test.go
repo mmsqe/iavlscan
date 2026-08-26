@@ -572,6 +572,55 @@ func TestUnlockedOpensAHeldDatabase(t *testing.T) {
 	}
 }
 
+// TestWalkToAndDelete walks the latest tree to a leaf the way a write would,
+// deletes that leaf to simulate damage, and checks the walk then fails on
+// exactly that node and the audit reports exactly that node missing.
+func TestWalkToAndDelete(t *testing.T) {
+	dir := t.TempDir()
+	buildFixture(t, dir)
+	path := filepath.Join(dir, "application.db")
+	key := []byte("evm/key0042")
+
+	db, err := pebble.Open(path, &pebble.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var leaf nodeKey
+	out := captureStdout(t, func() {
+		if leaf, err = walkTo(db, "evm", key); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "leaf "+leaf.String()+" holds it") || leaf.nonce == 1 {
+		t.Fatalf("walk did not end at a leaf:\n%s", out)
+	}
+	if _, err := walkTo(db, "evm", []byte("evm/nope")); err == nil {
+		t.Fatal("walk to an absent key succeeded")
+	}
+
+	captureStdout(t, func() {
+		if err := deleteNode(db, "evm", leaf); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := deleteNode(db, "evm", leaf); err == nil {
+		t.Fatal("deleting a node twice succeeded")
+	}
+	if _, err := walkTo(db, "evm", key); err == nil || !strings.Contains(err.Error(), leaf.String()+" is missing") {
+		t.Fatalf("walk after delete: %v", err)
+	}
+	out = captureStdout(t, func() {
+		if err := auditAll(db, []string{"evm"}, 5); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if want := leaf.String() + " is missing: 1 reference(s)"; !strings.Contains(out, want) {
+		t.Fatalf("audit output missing %q:\n%s", want, out)
+	}
+}
+
 func captureStdout(t testing.TB, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
