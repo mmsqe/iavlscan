@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"slices"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 const (
@@ -64,6 +66,7 @@ func run() error {
 		list   = flag.Bool("list", false, "print each store's node key range")
 		store  = flag.String("store", "", "restrict -audit and -nodekey to one store, and read -decode's tree key under it")
 		decode = flag.String("decode", "", "decode one node value, hex as printed by `pebble find`; needs no -db")
+		noLock = flag.Bool("no-lock", false, "skip the directory lock, to read a database a running node holds open")
 		hrp    = flag.String("bech32", "mantra", "account prefix for addresses in tree keys; empty prints them as hex")
 	)
 	flag.Usage = usage
@@ -88,9 +91,13 @@ func run() error {
 		return fmt.Errorf("-db is required")
 	}
 
-	// ReadOnly still takes the directory LOCK, so the node has to be stopped,
-	// or this pointed at a snapshot or copy of the data dir.
-	db, err := pebble.Open(*dbPath, &pebble.Options{ReadOnly: true})
+	// ReadOnly still takes the directory LOCK, so the node has to be stopped
+	// or this pointed at a snapshot -- unless told not to take the lock.
+	opts := &pebble.Options{ReadOnly: true}
+	if *noLock {
+		opts.FS = unlocked{vfs.Default}
+	}
+	db, err := pebble.Open(*dbPath, opts)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", *dbPath, err)
 	}
@@ -128,6 +135,8 @@ usage:
   iavlscan -decode <hex> [-store <name>]
 
 The node must be stopped: pebble locks the directory even in read-only mode.
+-no-lock reads a running node's database anyway. The node is unaffected, but a
+compaction can fail the scan midway; retry, or use a snapshot.
 
 flags:
 `)
@@ -728,6 +737,18 @@ func decodeBytes(buf []byte) (val, rest []byte, ok bool) {
 	}
 	return buf[n : n+int(l)], buf[n+int(l):], true
 }
+
+// unlocked is a filesystem whose directory lock is a no-op, to read a database
+// a running node holds open. ReadOnly writes nothing, so the node is unaffected;
+// a compaction can delete a file under the reader, which fails the scan rather
+// than skewing it.
+type unlocked struct{ vfs.FS }
+
+func (unlocked) Lock(string) (io.Closer, error) { return nopCloser{}, nil }
+
+type nopCloser struct{}
+
+func (nopCloser) Close() error { return nil }
 
 // upperBound is the exclusive end of a prefix range.
 func upperBound(prefix []byte) []byte {

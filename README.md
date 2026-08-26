@@ -23,9 +23,12 @@ iavlscan -decode "[0c421501f18296...0242]"                           # one node 
 which layout to read its tree key under.
 
 The node must be stopped: pebble locks the directory even in read-only mode.
-Point `-db` at a snapshot or a copy otherwise. `-audit` and `-nodekey` read
-every node once and are disk bound, so on a mainnet database expect hours;
-`-audit` also holds 8 bytes of memory per node of the largest store.
+Point `-db` at a snapshot or a copy, or pass `-no-lock` to read the running
+node's database in place: nothing is written, so the node is unaffected, but a
+compaction can remove a file under the scan and fail it. `-audit` and
+`-nodekey` read every node once and are disk bound, so on a mainnet database
+expect hours; `-audit` also holds 8 bytes of memory per node of the largest
+store.
 
 `-audit` is the one to start with:
 

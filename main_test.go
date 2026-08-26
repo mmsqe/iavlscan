@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/iavl"
 	iavldb "github.com/cosmos/iavl/db"
@@ -540,6 +541,34 @@ func TestAuditMaxReport(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestUnlockedOpensAHeldDatabase holds a fixture open the way a running node
+// does and checks that only the unlocked filesystem can open it again.
+func TestUnlockedOpensAHeldDatabase(t *testing.T) {
+	dir := t.TempDir()
+	buildFixture(t, dir)
+	path := filepath.Join(dir, "application.db")
+
+	holder, err := pebble.Open(path, &pebble.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+
+	if db, err := pebble.Open(path, &pebble.Options{ReadOnly: true}); err == nil {
+		db.Close()
+		t.Fatal("a second open succeeded while the lock was held")
+	}
+
+	db, err := pebble.Open(path, &pebble.Options{ReadOnly: true, FS: unlocked{vfs.Default}})
+	if err != nil {
+		t.Fatalf("unlocked open: %v", err)
+	}
+	defer db.Close()
+	if names, err := storeNames(db); err != nil || len(names) != 2 {
+		t.Fatalf("read through the unlocked open: names=%v err=%v", names, err)
 	}
 }
 
