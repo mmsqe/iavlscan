@@ -61,14 +61,16 @@ func run() error {
 		audit  = flag.Bool("audit", false, "check every reference in every store, reporting dangling ones")
 		maxRep = flag.Int("max-report", 20, "with -audit, dangling references to print per store")
 		list   = flag.Bool("list", false, "print each store's node key range")
-		store  = flag.String("store", "", "restrict -audit and -nodekey to one store")
+		store  = flag.String("store", "", "restrict -audit and -nodekey to one store, and read -decode's tree key under it")
 		decode = flag.String("decode", "", "decode one node value, hex as printed by `pebble find`; needs no -db")
+		hrp    = flag.String("bech32", "mantra", "account prefix for addresses in tree keys; empty prints them as hex")
 	)
 	flag.Usage = usage
 	flag.Parse()
+	bech32HRP = *hrp
 
 	if *decode != "" {
-		return decodeValue(*decode)
+		return decodeValue(*store, *decode)
 	}
 	var target nodeKey
 	if *rawKey != "" {
@@ -122,7 +124,7 @@ usage:
   iavlscan -db <application.db> -audit
   iavlscan -db <application.db> -nodekey <hex>
   iavlscan -db <application.db> -list
-  iavlscan -decode <hex>
+  iavlscan -decode <hex> [-store <name>]
 
 The node must be stopped: pebble locks the directory even in read-only mode.
 
@@ -284,7 +286,7 @@ func findParents(db *pebble.DB, names []string, target nodeKey) error {
 	for _, name := range names {
 		if n, ok := getNode(db, name, target); ok {
 			present[name] = true
-			fmt.Printf("%v is present in %s, %s\n", target, name, where(n))
+			fmt.Printf("%v is present in %s, %s\n", target, name, where(name, n))
 		}
 	}
 	if len(present) == 0 {
@@ -308,7 +310,7 @@ func findParents(db *pebble.DB, names []string, target nodeKey) error {
 				dangling++
 				note = " (dangling)"
 			}
-			fmt.Printf("  %s: %s %s %s%s; %s\n", name, parent, r.side, target, note, where(n))
+			fmt.Printf("  %s: %s %s %s%s; %s\n", name, parent, r.side, target, note, where(name, n))
 			return nil
 		})
 		if err != nil {
@@ -447,21 +449,21 @@ func getNode(db *pebble.DB, store string, nk nodeKey) (node, bool) {
 // whereOf is where(getNode(...)) for a report, "?" if the node cannot be read.
 func whereOf(db *pebble.DB, store string, nk nodeKey) string {
 	if n, ok := getNode(db, store, nk); ok {
-		return where(n)
+		return where(store, n)
 	}
 	return "?"
 }
 
 // where places a record for a report: the tree key it sits under, or the kind
 // of root it is when it has none.
-func where(n node) string {
+func where(store string, n node) string {
 	switch {
 	case n.ref:
 		return fmt.Sprintf("reference root -> %v", n.refTo)
 	case n.empty:
 		return "empty root"
 	}
-	return "tree key=" + describe(n.key)
+	return "tree key=" + describeKey(store, n.key)
 }
 
 // resolves reports whether a reference finds a node, mirroring nodeDB.GetNode:
@@ -495,8 +497,9 @@ func packNodeKey(nk nodeKey) (uint64, bool) {
 }
 
 // decodeValue prints one node value, taken from the [...] field of a
-// `pebble find` or `pebble sstable scan` line.
-func decodeValue(raw string) error {
+// `pebble find` or `pebble sstable scan` line. Without a store the tree key
+// stays hex.
+func decodeValue(store, raw string) error {
 	raw = strings.TrimSpace(raw)
 	raw = strings.TrimPrefix(strings.TrimSuffix(raw, "]"), "[") // as pebble prints it
 	raw = strings.TrimPrefix(raw, "0x")
@@ -525,7 +528,7 @@ func decodeValue(raw string) error {
 	}
 	fmt.Printf("height    %d  (%s)\n", n.height, kind)
 	fmt.Printf("size      %d\n", n.size)
-	fmt.Printf("tree key  %s\n", describe(n.key))
+	fmt.Printf("tree key  %s\n", describeKey(store, n.key))
 	if n.leaf {
 		fmt.Printf("value     %s\n", describe(n.value))
 	} else {

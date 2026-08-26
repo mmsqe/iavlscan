@@ -4,6 +4,7 @@ go 1.24
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/cosmos/btcutil v1.0.5
 	github.com/cosmos/cosmos-db v1.1.3
 	github.com/cosmos/iavl v1.2.4
 )

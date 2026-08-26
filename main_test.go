@@ -219,13 +219,13 @@ func TestDecodeNodeReferenceRoot(t *testing.T) {
 	}
 
 	// Reports must say what a root is rather than show an empty tree key.
-	if got := where(node{ref: true, refTo: nodeKey{version: 7, nonce: 1}}); got != "reference root -> (v7,n1)" {
+	if got := where("evm", node{ref: true, refTo: nodeKey{version: 7, nonce: 1}}); got != "reference root -> (v7,n1)" {
 		t.Fatalf("where(reference root) = %q", got)
 	}
-	if got := where(node{empty: true}); got != "empty root" {
+	if got := where("evm", node{empty: true}); got != "empty root" {
 		t.Fatalf("where(empty root) = %q", got)
 	}
-	if got := where(node{key: []byte("params")}); got != "tree key=706172616d73 (\"params\")" {
+	if got := where("evm", node{key: []byte("params")}); got != "tree key=706172616d73 (\"params\")" {
 		t.Fatalf("where(node) = %q", got)
 	}
 
@@ -243,7 +243,7 @@ func TestDecodeValue(t *testing.T) {
 	// pebble prints the value in brackets; 0x is what a hex viewer adds.
 	for _, in := range []string{accRoot, "[" + accRoot + "]", "0x" + accRoot, "  " + accRoot + " "} {
 		out := captureStdout(t, func() {
-			if err := decodeValue(in); err != nil {
+			if err := decodeValue("", in); err != nil {
 				t.Fatalf("decodeValue(%q): %v", in, err)
 			}
 		})
@@ -257,7 +257,7 @@ func TestDecodeValue(t *testing.T) {
 		}
 	}
 	for _, in := range []string{"nothex", "ff"} {
-		if err := decodeValue(in); err == nil {
+		if err := decodeValue("", in); err == nil {
 			t.Fatalf("decodeValue(%q) succeeded, want error", in)
 		}
 	}
@@ -284,7 +284,7 @@ func TestDecodeValueLeaf(t *testing.T) {
 			return nil // one printed sample is enough
 		}
 		out := captureStdout(t, func() {
-			if err := decodeValue(hex.EncodeToString(val)); err != nil {
+			if err := decodeValue("", hex.EncodeToString(val)); err != nil {
 				t.Fatal(err)
 			}
 		})
