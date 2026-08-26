@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -331,41 +332,76 @@ type dangling struct {
 	ref    reference
 }
 
+// missingNode is one absent node and what points at it: the earliest
+// reference, kept whole for the report, the latest parent version, and how
+// many references there are in between.
+type missingNode struct {
+	nk    nodeKey
+	first dangling
+	last  int64
+	refs  int
+}
+
+// groupMissing folds dangling references by the node they point at, oldest
+// node first. found is in parent key order, so a node's first reference is
+// from its earliest parent and its last from the latest.
+func groupMissing(found []dangling) []missingNode {
+	byNode := map[nodeKey]*missingNode{}
+	for _, d := range found {
+		m, ok := byNode[d.ref.nk]
+		if !ok {
+			m = &missingNode{nk: d.ref.nk, first: d}
+			byNode[d.ref.nk] = m
+		}
+		m.last = d.parent.version
+		m.refs++
+	}
+	out := make([]missingNode, 0, len(byNode))
+	for _, m := range byNode {
+		out = append(out, *m)
+	}
+	slices.SortFunc(out, func(a, b missingNode) int {
+		return cmp.Or(cmp.Compare(a.nk.version, b.nk.version), cmp.Compare(a.nk.nonce, b.nk.nonce))
+	})
+	return out
+}
+
 // auditAll checks every reference in every store, so the damage can be read as
 // isolated (one bad prune decision) or widespread (bulk loss). It is disk
 // bound: one pass over every node, and 8 bytes of memory per node of the
 // largest store.
 func auditAll(db *pebble.DB, names []string, maxReport int) error {
 	var (
-		totalRefs, totalDangling int
-		missing                  = map[nodeKey]bool{}
-		hitStores                []string
+		totalRefs, totalDangling, totalMissing int
+		hitStores                              []string
 	)
 	for _, name := range names {
 		nodes, found, refs, err := auditStore(db, name)
 		if err != nil {
 			return fmt.Errorf("audit store %s: %w", name, err)
 		}
+		gone := groupMissing(found)
 		totalRefs += refs
 		totalDangling += len(found)
-		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%d\n", name, nodes, refs, len(found))
-		if len(found) == 0 {
+		totalMissing += len(gone)
+		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%-9d missing=%d\n", name, nodes, refs, len(found), len(gone))
+		if len(gone) == 0 {
 			continue
 		}
 		hitStores = append(hitStores, name)
-		for _, d := range found {
-			missing[d.ref.nk] = true
+		// One line per missing node, not per reference: a parent rewritten
+		// every block references the same missing child once per version.
+		for _, g := range gone[:min(len(gone), maxReport)] {
+			fmt.Printf("      %s is missing: %d reference(s) from parents v%d..v%d; %s of %s, %s\n",
+				g.nk, g.refs, g.first.parent.version, g.last, g.first.ref.side, g.first.parent, whereOf(db, name, g.first.parent))
 		}
-		for _, d := range found[:min(len(found), maxReport)] {
-			fmt.Printf("      %s %s %s is missing; %s\n", d.parent, d.ref.side, d.ref.nk, whereOf(db, name, d.parent))
-		}
-		if len(found) > maxReport {
-			fmt.Printf("      ... and %d more not printed (raise -max-report to see them)\n", len(found)-maxReport)
+		if len(gone) > maxReport {
+			fmt.Printf("      ... and %d more missing node(s) not printed (raise -max-report to see them)\n", len(gone)-maxReport)
 		}
 	}
 
-	fmt.Printf("\nchecked %d references: %d dangling, %d distinct missing node(s), %d store(s) affected\n",
-		totalRefs, totalDangling, len(missing), len(hitStores))
+	fmt.Printf("\nchecked %d references: %d dangling, %d missing node(s), %d store(s) affected\n",
+		totalRefs, totalDangling, totalMissing, len(hitStores))
 	if totalDangling == 0 {
 		fmt.Println("every reference resolves; this database is internally consistent")
 	} else {

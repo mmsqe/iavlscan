@@ -402,7 +402,7 @@ func TestAuditHealthy(t *testing.T) {
 	})
 	// 2 stores x 299 inner nodes x 2 children.
 	for _, want := range []string{
-		"checked 1196 references: 0 dangling, 0 distinct missing node(s), 0 store(s) affected",
+		"checked 1196 references: 0 dangling, 0 missing node(s), 0 store(s) affected",
 		"internally consistent",
 	} {
 		if !strings.Contains(out, want) {
@@ -424,8 +424,8 @@ func TestAuditFindsDamage(t *testing.T) {
 	// The removed node was referenced once, by its parent in evm only; bank
 	// holds a node with the same key and must stay clean.
 	for _, want := range []string{
-		"child (v1,n7) is missing",
-		"1 dangling, 1 distinct missing node(s), 1 store(s) affected",
+		"(v1,n7) is missing: 1 reference(s) from parents v1..v1; ",
+		"1 dangling, 1 missing node(s), 1 store(s) affected",
 		"affected stores: evm",
 	} {
 		if !strings.Contains(out, want) {
@@ -513,8 +513,12 @@ func TestAuditMultiVersion(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	want := fmt.Sprintf("%d dangling, 2 distinct missing node(s), 1 store(s) affected", count[older]+count[same])
-	for _, w := range []string{want, older.String() + " is missing", same.String() + " is missing"} {
+	want := fmt.Sprintf("%d dangling, 2 missing node(s), 1 store(s) affected", count[older]+count[same])
+	for _, w := range []string{
+		want,
+		fmt.Sprintf("%v is missing: %d reference(s)", older, count[older]),
+		fmt.Sprintf("%v is missing: %d reference(s)", same, count[same]),
+	} {
 		if !strings.Contains(out, w) {
 			t.Fatalf("output missing %q:\n%s", w, out)
 		}
@@ -532,7 +536,7 @@ func TestAuditMaxReport(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	for _, want := range []string{"... and 1 more not printed", "2 dangling, 2 distinct missing node(s)"} {
+	for _, want := range []string{"... and 1 more missing node(s) not printed", "2 dangling, 2 missing node(s)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}

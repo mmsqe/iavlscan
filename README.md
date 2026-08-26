@@ -30,17 +30,19 @@ every node once and are disk bound, so on a mainnet database expect hours;
 `-audit` is the one to start with:
 
 ```
-  bank                     nodes=9364      refs=13742     dangling=1
-      (v17530112,n88) left child (v16678423,n242) is missing; tree key=0214a6fd...e2616d616e747261
-        (bank/Balance holder=mantra15m77x4pe6w9vtpuqm22qxu0ds7vn4ehzwx8pls denom="amantra")
+  distribution             nodes=30665252  refs=42565394  dangling=3766961  missing=217
+      (v16678423,n242) is missing: 80018 reference(s) from parents v17447578..v17527595; left child of (v17447578,n172), tree key=0614388f...86aa1 (distribution/ValidatorCurrentRewards val=mantravaloper18z8jw8wpqq3pe8t87cuf7ed98eg8s64pn6udx3)
+      ... and 216 more missing node(s) not printed (raise -max-report to see them)
 
-checked 83926 references: 1 dangling, 1 distinct missing node(s), 1 store(s) affected
+checked 42565394 references: 3766961 dangling, 217 missing node(s), 1 store(s) affected
 ```
 
-One dangling edge is surgical, what a targeted delete looks like. Many across
-stores is bulk loss. The tree key names the module data under the damaged
-branch. To tell a delete from a lost write, `pebble find` on the missing key
-shows whether a `DEL` tombstone survives.
+Count missing nodes, not references: a parent rewritten every block references
+the same missing child once per version. One missing node is surgical, what a
+targeted delete looks like; many is a prune gone wrong or bulk loss. The tree
+key names the module data under the damaged branch. To tell a delete from a
+lost write, `pebble find` on the missing node key shows whether a `DEL`
+tombstone survives.
 
 ## Tree keys
 
