@@ -434,6 +434,34 @@ func findParents(db *pebble.DB, names []string, target nodeKey) error {
 	return nil
 }
 
+// versionRange is a run of versions with no root record.
+type versionRange struct{ from, to int64 }
+
+func (r versionRange) String() string {
+	if r.from == r.to {
+		return fmt.Sprintf("no root record for version %d", r.from)
+	}
+	return fmt.Sprintf("no root record for versions %d..%d (%d)", r.from, r.to, r.to-r.from+1)
+}
+
+// storeAudit is what one store's pass found.
+type storeAudit struct {
+	nodes    int
+	refs     int
+	dangling []dangling
+	gaps     []versionRange
+}
+
+// report prints up to maxReport lines, then says how many it held back.
+func report[T fmt.Stringer](items []T, maxReport int, what string) {
+	for _, it := range items[:min(len(items), maxReport)] {
+		fmt.Printf("      %s\n", it)
+	}
+	if n := len(items) - maxReport; n > 0 {
+		fmt.Printf("      ... and %d more %s not printed (raise -max-report to see them)\n", n, what)
+	}
+}
+
 // dangling is one reference to a node that is not in the database.
 type dangling struct {
 	parent nodeKey
@@ -448,6 +476,20 @@ type missingNode struct {
 	first dangling
 	last  int64
 	refs  int
+}
+
+// placed is a missing node ready to print. Locating the parent costs a read,
+// so it happens in String, which report only calls for the lines it prints.
+type placed struct {
+	missingNode
+	db    *pebble.DB
+	store string
+}
+
+func (p placed) String() string {
+	return fmt.Sprintf("%s is missing: %d reference(s) from parents v%d..v%d; %s of %s, %s",
+		p.nk, p.refs, p.first.parent.version, p.last, p.first.ref.side, p.first.parent,
+		whereOf(p.db, p.store, p.first.parent))
 }
 
 // groupMissing folds dangling references by the node they point at, oldest
@@ -480,37 +522,40 @@ func groupMissing(found []dangling) []missingNode {
 // largest store.
 func auditAll(db *pebble.DB, names []string, maxReport int) error {
 	var (
-		totalRefs, totalDangling, totalMissing int
-		hitStores                              []string
+		totalRefs, totalDangling, totalMissing, totalGaps int
+		hitStores                                         []string
 	)
 	for _, name := range names {
-		nodes, found, refs, err := auditStore(db, name)
+		a, err := auditStore(db, name)
 		if err != nil {
 			return fmt.Errorf("audit store %s: %w", name, err)
 		}
-		gone := groupMissing(found)
-		totalRefs += refs
-		totalDangling += len(found)
+		gone := groupMissing(a.dangling)
+		totalRefs += a.refs
+		totalDangling += len(a.dangling)
 		totalMissing += len(gone)
-		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%-9d missing=%d\n", name, nodes, refs, len(found), len(gone))
-		if len(gone) == 0 {
+		totalGaps += len(a.gaps)
+		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%-9d missing=%-9d root gaps=%d\n",
+			name, a.nodes, a.refs, len(a.dangling), len(gone), len(a.gaps))
+		if len(gone) == 0 && len(a.gaps) == 0 {
 			continue
 		}
 		hitStores = append(hitStores, name)
+		// Nothing references a root, so the reference check cannot see one go
+		// missing; a gap is what parks the pruner on "version does not exist".
+		report(a.gaps, maxReport, "root gap(s)")
 		// One line per missing node, not per reference: a parent rewritten
 		// every block references the same missing child once per version.
-		for _, g := range gone[:min(len(gone), maxReport)] {
-			fmt.Printf("      %s is missing: %d reference(s) from parents v%d..v%d; %s of %s, %s\n",
-				g.nk, g.refs, g.first.parent.version, g.last, g.first.ref.side, g.first.parent, whereOf(db, name, g.first.parent))
+		lines := make([]placed, len(gone))
+		for i, g := range gone {
+			lines[i] = placed{g, db, name}
 		}
-		if len(gone) > maxReport {
-			fmt.Printf("      ... and %d more missing node(s) not printed (raise -max-report to see them)\n", len(gone)-maxReport)
-		}
+		report(lines, maxReport, "missing node(s)")
 	}
 
-	fmt.Printf("\nchecked %d references: %d dangling, %d missing node(s), %d store(s) affected\n",
-		totalRefs, totalDangling, totalMissing, len(hitStores))
-	if totalDangling == 0 {
+	fmt.Printf("\nchecked %d references: %d dangling, %d missing node(s), %d root gap(s), %d store(s) affected\n",
+		totalRefs, totalDangling, totalMissing, totalGaps, len(hitStores))
+	if len(hitStores) == 0 {
 		fmt.Println("every reference resolves; this database is internally consistent")
 	} else {
 		fmt.Printf("affected stores: %s\n", strings.Join(hitStores, " "))
@@ -527,17 +572,23 @@ func auditAll(db *pebble.DB, names []string, maxReport int) error {
 // key order a reference to an older version always finds its node already in
 // the array, and a same-version reference only has to wait until the version
 // ends. Nothing needs a second pass.
-func auditStore(db *pebble.DB, store string) (nodes int, found []dangling, refs int, err error) {
+func auditStore(db *pebble.DB, store string) (a storeAudit, err error) {
 	var (
 		keys    []uint64
 		buf     = make([]reference, 0, 2)
 		pending []dangling // same-version references, checked once the version is complete
 		version int64
 	)
+	// hasVersion and GetRoot both look only at nonce 1, so a version above
+	// the first one carrying it, but with none of its own, is a hole the
+	// pruner parks on, reporting "version does not exist". Nodes that outlive
+	// their own root are ordinary: a pruned version keeps whatever later
+	// versions still share.
+	var lastRoot int64
 	flush := func() {
 		for _, d := range pending {
 			if !resolves(keys, d.ref.nk) {
-				found = append(found, d)
+				a.dangling = append(a.dangling, d)
 			}
 		}
 		pending = pending[:0]
@@ -552,6 +603,12 @@ func auditStore(db *pebble.DB, store string) (nodes int, found []dangling, refs 
 			return fmt.Errorf("node key %v does not fit the packed form", parent)
 		}
 		keys = append(keys, packed)
+		if parent.nonce == 1 {
+			if lastRoot != 0 && parent.version > lastRoot+1 {
+				a.gaps = append(a.gaps, versionRange{lastRoot + 1, parent.version - 1})
+			}
+			lastRoot = parent.version
+		}
 
 		n, ok := decodeNode(val)
 		if !ok {
@@ -561,19 +618,20 @@ func auditStore(db *pebble.DB, store string) (nodes int, found []dangling, refs 
 			if r.legacy {
 				continue
 			}
-			refs++
+			a.refs++
 			d := dangling{parent: parent, ref: r}
 			switch {
 			case r.nk.version >= parent.version:
 				pending = append(pending, d)
 			case !resolves(keys, r.nk):
-				found = append(found, d)
+				a.dangling = append(a.dangling, d)
 			}
 		}
 		return nil
 	})
 	flush()
-	return len(keys), found, refs, err
+	a.nodes = len(keys)
+	return a, err
 }
 
 // getNode fetches and decodes one node, with nodeDB.GetNode's fallback from a

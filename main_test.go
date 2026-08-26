@@ -403,7 +403,7 @@ func TestAuditHealthy(t *testing.T) {
 	})
 	// 2 stores x 299 inner nodes x 2 children.
 	for _, want := range []string{
-		"checked 1196 references: 0 dangling, 0 missing node(s), 0 store(s) affected",
+		"checked 1196 references: 0 dangling, 0 missing node(s), 0 root gap(s), 0 store(s) affected",
 		"internally consistent",
 	} {
 		if !strings.Contains(out, want) {
@@ -426,7 +426,7 @@ func TestAuditFindsDamage(t *testing.T) {
 	// holds a node with the same key and must stay clean.
 	for _, want := range []string{
 		"(v1,n7) is missing: 1 reference(s) from parents v1..v1; ",
-		"1 dangling, 1 missing node(s), 1 store(s) affected",
+		"1 dangling, 1 missing node(s), 0 root gap(s), 1 store(s) affected",
 		"affected stores: evm",
 	} {
 		if !strings.Contains(out, want) {
@@ -514,7 +514,7 @@ func TestAuditMultiVersion(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	want := fmt.Sprintf("%d dangling, 2 missing node(s), 1 store(s) affected", count[older]+count[same])
+	want := fmt.Sprintf("%d dangling, 2 missing node(s), 0 root gap(s), 1 store(s) affected", count[older]+count[same])
 	for _, w := range []string{
 		want,
 		fmt.Sprintf("%v is missing: %d reference(s)", older, count[older]),
@@ -618,6 +618,45 @@ func TestWalkToAndDelete(t *testing.T) {
 	})
 	if want := leaf.String() + " is missing: 1 reference(s)"; !strings.Contains(out, want) {
 		t.Fatalf("audit output missing %q:\n%s", want, out)
+	}
+}
+
+// TestAuditFindsRootGap covers what the reference check cannot see: a root
+// record is an entry point, not anyone's child, so deleting one leaves no
+// dangling reference -- only a hole in the versions, which is what parks the
+// pruner on "version does not exist".
+func TestAuditFindsRootGap(t *testing.T) {
+	dir := t.TempDir()
+	buildVersioned(t, dir, 12, 5, 50)
+	path := filepath.Join(dir, "application.db")
+
+	db, err := pebble.Open(path, &pebble.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Version 6's root, with no nonce-0 stand-in: the version becomes
+	// unreadable while every reference in the tree still resolves.
+	gone := nodeKey{version: 6, nonce: 1}
+	if err := deleteNode(db, "evm", gone); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+
+	db, names := openFixture(t, dir)
+	out := captureStdout(t, func() {
+		if err := auditAll(db, names, 20); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// A store with only a gap must still be named as affected.
+	for _, want := range []string{"no root record for version 6", "1 root gap(s)", "affected stores: evm"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "0 dangling") {
+		t.Fatalf("a missing root is not a dangling reference:\n%s", out)
 	}
 }
 

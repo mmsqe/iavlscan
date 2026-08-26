@@ -41,12 +41,16 @@ store.
 `-audit` is the one to start with:
 
 ```
-  distribution             nodes=30665252  refs=42565394  dangling=3766961  missing=217
+  distribution             nodes=30665252  refs=42565394  dangling=3766961  missing=217       root gaps=0
       (v16678423,n242) is missing: 80018 reference(s) from parents v17447578..v17527595; left child of (v17447578,n172), tree key=0614388f...86aa1 (distribution/ValidatorCurrentRewards val=mantravaloper18z8jw8wpqq3pe8t87cuf7ed98eg8s64pn6udx3)
       ... and 216 more missing node(s) not printed (raise -max-report to see them)
 
-checked 42565394 references: 3766961 dangling, 217 missing node(s), 1 store(s) affected
+checked 42565394 references: 3766961 dangling, 217 missing node(s), 0 root gap(s), 1 store(s) affected
 ```
+
+Root gaps are counted separately: nothing references a root, so the reference
+check cannot see one go missing. A gap parks pruning on `version does not
+exist`.
 
 Count missing nodes, not references: a parent rewritten every block references
 the same missing child once per version. One missing node is surgical, what a
