@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/iavl"
 	iavldb "github.com/cosmos/iavl/db"
@@ -22,16 +20,40 @@ import (
 const accRoot = "0c421501f1829676db577682e944fc3493d451b67ff3e29f20" +
 	"2d8f346f5fb182037ba090b1524bad5512a9147c958b096d79649709b0daf9070002040242"
 
-// buildFixture writes two real IAVL stores into one pebble application.db,
-// laid out the way rootmulti does, so the tests run against bytes iavl wrote
-// rather than bytes this package's decoder produced. Each store is 300 leaves
-// under 299 inner nodes, all at version 1, root (v1,n1).
-func buildFixture(t *testing.T, dir string, damage ...nodeKey) {
+// eachBackend runs fn against both formats a node writes application.db in;
+// the scans must not be able to tell them apart.
+func eachBackend(t *testing.T, fn func(t *testing.T, backend string)) {
 	t.Helper()
-	db, err := dbm.NewPebbleDB("application", dir, nil)
-	if err != nil {
-		t.Fatalf("open: %v", err)
+	for _, backend := range []string{backendPebble, backendLevel} {
+		t.Run(backend, func(t *testing.T) { fn(t, backend) })
 	}
+}
+
+// newFixtureDB opens dir/application.db the way a node would.
+func newFixtureDB(t testing.TB, backend, dir string) dbm.DB {
+	t.Helper()
+	var (
+		db  dbm.DB
+		err error
+	)
+	if backend == backendLevel {
+		db, err = dbm.NewGoLevelDB("application", dir, nil)
+	} else {
+		db, err = dbm.NewPebbleDB("application", dir, nil)
+	}
+	if err != nil {
+		t.Fatalf("open %s: %v", backend, err)
+	}
+	return db
+}
+
+// buildFixture writes two real IAVL stores into one application.db, laid out
+// the way rootmulti does, so the tests run against bytes iavl wrote rather
+// than bytes this package's decoder produced. Each store is 300 leaves under
+// 299 inner nodes, all at version 1, root (v1,n1).
+func buildFixture(t *testing.T, backend, dir string, damage ...nodeKey) {
+	t.Helper()
+	db := newFixtureDB(t, backend, dir)
 	defer db.Close()
 
 	for _, store := range []string{"evm", "bank"} {
@@ -57,12 +79,9 @@ func buildFixture(t *testing.T, dir string, damage ...nodeKey) {
 
 // buildVersioned writes one evm store that grew over many versions, the way
 // a real chain's does: each version updates `updates` keys out of `keyspace`.
-func buildVersioned(t testing.TB, dir string, versions, updates, keyspace int, damage ...nodeKey) {
+func buildVersioned(t testing.TB, backend, dir string, versions, updates, keyspace int, damage ...nodeKey) {
 	t.Helper()
-	db, err := dbm.NewPebbleDB("application", dir, nil)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	db := newFixtureDB(t, backend, dir)
 	defer db.Close()
 
 	pdb := dbm.NewPrefixDB(db, []byte(rootPrefix+"evm/"))
@@ -85,11 +104,12 @@ func buildVersioned(t testing.TB, dir string, versions, updates, keyspace int, d
 	}
 }
 
-func openFixture(t testing.TB, dir string) (*pebble.DB, []string) {
+// openFixture reopens a fixture the way iavlscan does, detection included.
+func openFixture(t testing.TB, dir string) (kvDB, []string) {
 	t.Helper()
-	db, err := pebble.Open(filepath.Join(dir, "application.db"), &pebble.Options{ReadOnly: true})
+	db, err := openDB(filepath.Join(dir, "application.db"), backendAuto, false, false)
 	if err != nil {
-		t.Fatalf("pebble open: %v", err)
+		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	names, err := storeNames(db)
@@ -123,11 +143,37 @@ func TestParseNodeKey(t *testing.T) {
 }
 
 func TestStoreNames(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir)
-	_, names := openFixture(t, dir)
-	if len(names) != 2 || names[0] != "bank" || names[1] != "evm" {
-		t.Fatalf("got %v, want [bank evm]", names)
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		_, names := openFixture(t, dir)
+		if len(names) != 2 || names[0] != "bank" || names[1] != "evm" {
+			t.Fatalf("got %v, want [bank evm]", names)
+		}
+	})
+}
+
+// TestDetectBackend pins the detection every other test leans on by opening
+// its fixture without -backend.
+func TestDetectBackend(t *testing.T) {
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		got, err := detectBackend(filepath.Join(dir, "application.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != backend {
+			t.Fatalf("detectBackend = %q, want %q", got, backend)
+		}
+	})
+
+	// An empty directory names neither, and must say so rather than guess.
+	if _, err := detectBackend(t.TempDir()); err == nil {
+		t.Fatal("an empty directory was detected as a database")
+	}
+	if err := setBackend("rocksdb"); err == nil {
+		t.Fatal("-backend rocksdb was accepted")
 	}
 }
 
@@ -135,44 +181,46 @@ func TestStoreNames(t *testing.T) {
 // every node must be referenced exactly once except the root, and nothing may
 // dangle.
 func TestDecodeRebuildsTree(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir)
-	db, _ := openFixture(t, dir)
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		db, _ := openFixture(t, dir)
 
-	refs := map[nodeKey]int{}
-	nodes := map[nodeKey]bool{}
-	err := eachNode(db, "evm", nodeKey{}, func(nk nodeKey, val []byte) error {
-		nodes[nk] = true
-		n, ok := decodeNode(val)
-		if !ok {
-			t.Fatalf("failed to decode node %v", nk)
+		refs := map[nodeKey]int{}
+		nodes := map[nodeKey]bool{}
+		err := eachNode(db, "evm", nodeKey{}, func(nk nodeKey, val []byte) error {
+			nodes[nk] = true
+			n, ok := decodeNode(val)
+			if !ok {
+				t.Fatalf("failed to decode node %v", nk)
+			}
+			if n.trailing != 0 {
+				t.Fatalf("node %v left %d trailing bytes", nk, n.trailing)
+			}
+			for _, r := range n.outgoing(nil) {
+				refs[r.nk]++
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
 		}
-		if n.trailing != 0 {
-			t.Fatalf("node %v left %d trailing bytes", nk, n.trailing)
+
+		if len(nodes) != 599 {
+			t.Fatalf("got %d nodes, want 599", len(nodes))
 		}
-		for _, r := range n.outgoing(nil) {
-			refs[r.nk]++
+		if len(refs) != 598 {
+			t.Fatalf("got %d referenced nodes, want 598", len(refs))
 		}
-		return nil
+		for nk, count := range refs {
+			if count != 1 {
+				t.Fatalf("node %v referenced %d times", nk, count)
+			}
+			if !nodes[nk] {
+				t.Fatalf("dangling reference to %v in a healthy tree", nk)
+			}
+		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(nodes) != 599 {
-		t.Fatalf("got %d nodes, want 599", len(nodes))
-	}
-	if len(refs) != 598 {
-		t.Fatalf("got %d referenced nodes, want 598", len(refs))
-	}
-	for nk, count := range refs {
-		if count != 1 {
-			t.Fatalf("node %v referenced %d times", nk, count)
-		}
-		if !nodes[nk] {
-			t.Fatalf("dangling reference to %v in a healthy tree", nk)
-		}
-	}
 }
 
 func TestDecodeNodeGolden(t *testing.T) {
@@ -267,67 +315,71 @@ func TestDecodeValue(t *testing.T) {
 // TestDecodeValueLeaf checks the leaf branch against real leaves from the
 // fixture rather than a hand-built value.
 func TestDecodeValueLeaf(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir)
-	db, _ := openFixture(t, dir)
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		db, _ := openFixture(t, dir)
 
-	var leaves int
-	err := eachNode(db, "evm", nodeKey{}, func(_ nodeKey, val []byte) error {
-		n, ok := decodeNode(val)
-		if !ok || !n.leaf {
-			return nil
-		}
-		leaves++
-		if n.height != 0 || n.size != 1 || !strings.HasPrefix(string(n.key), "evm/key") {
-			t.Fatalf("leaf height=%d size=%d key=%q, want 0/1/evm/key*", n.height, n.size, n.key)
-		}
-		if leaves > 1 {
-			return nil // one printed sample is enough
-		}
-		out := captureStdout(t, func() {
-			if err := decodeValue("", hex.EncodeToString(val)); err != nil {
-				t.Fatal(err)
+		var leaves int
+		err := eachNode(db, "evm", nodeKey{}, func(_ nodeKey, val []byte) error {
+			n, ok := decodeNode(val)
+			if !ok || !n.leaf {
+				return nil
 			}
+			leaves++
+			if n.height != 0 || n.size != 1 || !strings.HasPrefix(string(n.key), "evm/key") {
+				t.Fatalf("leaf height=%d size=%d key=%q, want 0/1/evm/key*", n.height, n.size, n.key)
+			}
+			if leaves > 1 {
+				return nil // one printed sample is enough
+			}
+			out := captureStdout(t, func() {
+				if err := decodeValue("", hex.EncodeToString(val)); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if !strings.Contains(out, "(leaf)") || !strings.Contains(out, "value  ") || strings.Contains(out, "trailing") {
+				t.Fatalf("unexpected leaf output:\n%s", out)
+			}
+			return nil
 		})
-		if !strings.Contains(out, "(leaf)") || !strings.Contains(out, "value  ") || strings.Contains(out, "trailing") {
-			t.Fatalf("unexpected leaf output:\n%s", out)
+		if err != nil {
+			t.Fatal(err)
 		}
-		return nil
+		if leaves != 300 {
+			t.Fatalf("decoded %d leaves, want 300", leaves)
+		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if leaves != 300 {
-		t.Fatalf("decoded %d leaves, want 300", leaves)
-	}
 }
 
 func TestFindParents(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir)
-	db, names := openFixture(t, dir)
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		db, names := openFixture(t, dir)
 
-	// Every nonce but the root's is some node's child, once per store.
-	out := captureStdout(t, func() {
-		if err := findParents(db, names, nodeKey{version: 1, nonce: 7}); err != nil {
-			t.Fatal(err)
+		// Every nonce but the root's is some node's child, once per store.
+		out := captureStdout(t, func() {
+			if err := findParents(db, names, nodeKey{version: 1, nonce: 7}); err != nil {
+				t.Fatal(err)
+			}
+		})
+		for _, want := range []string{"present in bank", "present in evm", "  evm: ", "  bank: ", "2 to (v1,n7), 0 dangling"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("output missing %q:\n%s", want, out)
+			}
 		}
-	})
-	for _, want := range []string{"present in bank", "present in evm", "  evm: ", "  bank: ", "2 to (v1,n7), 0 dangling"} {
-		if !strings.Contains(out, want) {
+
+		// A root is referenced by nobody.
+		out = captureStdout(t, func() {
+			if err := findParents(db, names, nodeKey{version: 1, nonce: 1}); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if want := "0 to (v1,n1), 0 dangling"; !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
-	}
-
-	// A root is referenced by nobody.
-	out = captureStdout(t, func() {
-		if err := findParents(db, names, nodeKey{version: 1, nonce: 1}); err != nil {
-			t.Fatal(err)
-		}
 	})
-	if want := "0 to (v1,n1), 0 dangling"; !strings.Contains(out, want) {
-		t.Fatalf("output missing %q:\n%s", want, out)
-	}
 }
 
 func TestPackNodeKey(t *testing.T) {
@@ -392,62 +444,66 @@ func TestResolves(t *testing.T) {
 }
 
 func TestAuditHealthy(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir)
-	db, names := openFixture(t, dir)
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		db, names := openFixture(t, dir)
 
-	out := captureStdout(t, func() {
-		if err := auditAll(db, names, 20); err != nil {
-			t.Fatal(err)
+		out := captureStdout(t, func() {
+			if err := auditAll(db, names, 20); err != nil {
+				t.Fatal(err)
+			}
+		})
+		// 2 stores x 299 inner nodes x 2 children.
+		for _, want := range []string{
+			"checked 1196 references: 0 dangling, 0 missing node(s), 0 root gap(s), 0 store(s) affected",
+			"internally consistent",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("output missing %q:\n%s", want, out)
+			}
 		}
 	})
-	// 2 stores x 299 inner nodes x 2 children.
-	for _, want := range []string{
-		"checked 1196 references: 0 dangling, 0 missing node(s), 0 root gap(s), 0 store(s) affected",
-		"internally consistent",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("output missing %q:\n%s", want, out)
-		}
-	}
 }
 
 func TestAuditFindsDamage(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir, nodeKey{version: 1, nonce: 7})
-	db, names := openFixture(t, dir)
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir, nodeKey{version: 1, nonce: 7})
+		db, names := openFixture(t, dir)
 
-	out := captureStdout(t, func() {
-		if err := auditAll(db, names, 20); err != nil {
-			t.Fatal(err)
+		out := captureStdout(t, func() {
+			if err := auditAll(db, names, 20); err != nil {
+				t.Fatal(err)
+			}
+		})
+		// The removed node was referenced once, by its parent in evm only; bank
+		// holds a node with the same key and must stay clean.
+		for _, want := range []string{
+			"(v1,n7) is missing: 1 reference(s) from parents v1..v1; ",
+			"1 dangling, 1 missing node(s), 0 root gap(s), 1 store(s) affected",
+			"affected stores: evm",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("output missing %q:\n%s", want, out)
+			}
+		}
+
+		// The targeted scan must reach the same verdict per store.
+		out = captureStdout(t, func() {
+			if err := findParents(db, names, nodeKey{version: 1, nonce: 7}); err != nil {
+				t.Fatal(err)
+			}
+		})
+		for _, want := range []string{"present in bank", "(v1,n7) (dangling)", "2 to (v1,n7), 1 dangling"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("output missing %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "present in evm") {
+			t.Fatalf("deleted node reported present in evm:\n%s", out)
 		}
 	})
-	// The removed node was referenced once, by its parent in evm only; bank
-	// holds a node with the same key and must stay clean.
-	for _, want := range []string{
-		"(v1,n7) is missing: 1 reference(s) from parents v1..v1; ",
-		"1 dangling, 1 missing node(s), 0 root gap(s), 1 store(s) affected",
-		"affected stores: evm",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("output missing %q:\n%s", want, out)
-		}
-	}
-
-	// The targeted scan must reach the same verdict per store.
-	out = captureStdout(t, func() {
-		if err := findParents(db, names, nodeKey{version: 1, nonce: 7}); err != nil {
-			t.Fatal(err)
-		}
-	})
-	for _, want := range []string{"present in bank", "(v1,n7) (dangling)", "2 to (v1,n7), 1 dangling"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("output missing %q:\n%s", want, out)
-		}
-	}
-	if strings.Contains(out, "present in evm") {
-		t.Fatalf("deleted node reported present in evm:\n%s", out)
-	}
 }
 
 // TestAuditMultiVersion exercises the single pass on a tree that grew over
@@ -455,170 +511,178 @@ func TestAuditFindsDamage(t *testing.T) {
 // same-version references wait for the version to end. One node of each kind
 // is then removed and both must be reported.
 func TestAuditMultiVersion(t *testing.T) {
-	const versions, updates, keyspace = 40, 25, 500
+	eachBackend(t, func(t *testing.T, backend string) {
+		const versions, updates, keyspace = 40, 25, 500
 
-	clean := t.TempDir()
-	buildVersioned(t, clean, versions, updates, keyspace)
-	db, names := openFixture(t, clean)
+		clean := t.TempDir()
+		buildVersioned(t, backend, clean, versions, updates, keyspace)
+		db, names := openFixture(t, clean)
 
-	out := captureStdout(t, func() {
-		if err := auditAll(db, names, 20); err != nil {
-			t.Fatal(err)
-		}
-	})
-	if !strings.Contains(out, "0 dangling") {
-		t.Fatalf("clean tree audited dirty:\n%s", out)
-	}
-
-	// Pick one child of each kind and count how many parents reference each,
-	// since an unchanged old node is referenced again by every later version.
-	var older, same nodeKey
-	count := map[nodeKey]int{}
-	err := eachRef(db, "evm", nodeKey{}, func(parent nodeKey, r reference, _ node) error {
-		count[r.nk]++
-		switch {
-		case r.nk.version < parent.version && older == (nodeKey{}):
-			older = r.nk
-		case r.nk.version == parent.version && same == (nodeKey{}):
-			if r.nk.nonce <= parent.nonce {
-				t.Fatalf("%v references same-version %v with a lower nonce; the single pass relies on pre-order nonces", parent, r.nk)
+		out := captureStdout(t, func() {
+			if err := auditAll(db, names, 20); err != nil {
+				t.Fatal(err)
 			}
-			same = r.nk
+		})
+		if !strings.Contains(out, "0 dangling") {
+			t.Fatalf("clean tree audited dirty:\n%s", out)
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if older == (nodeKey{}) || same == (nodeKey{}) || older == same {
-		t.Fatalf("fixture lacks both reference kinds: older=%v same=%v", older, same)
-	}
 
-	// findParents starts its scan at the target's version; it must still see
-	// every parent, which all live at that version or later.
-	out = captureStdout(t, func() {
-		if err := findParents(db, names, older); err != nil {
+		// Pick one child of each kind and count how many parents reference each,
+		// since an unchanged old node is referenced again by every later version.
+		var older, same nodeKey
+		count := map[nodeKey]int{}
+		err := eachRef(db, "evm", nodeKey{}, func(parent nodeKey, r reference, _ node) error {
+			count[r.nk]++
+			switch {
+			case r.nk.version < parent.version && older == (nodeKey{}):
+				older = r.nk
+			case r.nk.version == parent.version && same == (nodeKey{}):
+				if r.nk.nonce <= parent.nonce {
+					t.Fatalf("%v references same-version %v with a lower nonce; the single pass relies on pre-order nonces", parent, r.nk)
+				}
+				same = r.nk
+			}
+			return nil
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
-	})
-	if want := fmt.Sprintf("%d to %v", count[older], older); !strings.Contains(out, want) {
-		t.Fatalf("output missing %q:\n%s", want, out)
-	}
+		if older == (nodeKey{}) || same == (nodeKey{}) || older == same {
+			t.Fatalf("fixture lacks both reference kinds: older=%v same=%v", older, same)
+		}
 
-	damaged := t.TempDir()
-	buildVersioned(t, damaged, versions, updates, keyspace, older, same)
-	db, names = openFixture(t, damaged)
+		// findParents starts its scan at the target's version; it must still see
+		// every parent, which all live at that version or later.
+		out = captureStdout(t, func() {
+			if err := findParents(db, names, older); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if want := fmt.Sprintf("%d to %v", count[older], older); !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
 
-	out = captureStdout(t, func() {
-		if err := auditAll(db, names, 1000); err != nil {
-			t.Fatal(err)
+		damaged := t.TempDir()
+		buildVersioned(t, backend, damaged, versions, updates, keyspace, older, same)
+		db, names = openFixture(t, damaged)
+
+		out = captureStdout(t, func() {
+			if err := auditAll(db, names, 1000); err != nil {
+				t.Fatal(err)
+			}
+		})
+		want := fmt.Sprintf("%d dangling, 2 missing node(s), 0 root gap(s), 1 store(s) affected", count[older]+count[same])
+		for _, w := range []string{
+			want,
+			fmt.Sprintf("%v is missing: %d reference(s)", older, count[older]),
+			fmt.Sprintf("%v is missing: %d reference(s)", same, count[same]),
+		} {
+			if !strings.Contains(out, w) {
+				t.Fatalf("output missing %q:\n%s", w, out)
+			}
 		}
 	})
-	want := fmt.Sprintf("%d dangling, 2 missing node(s), 0 root gap(s), 1 store(s) affected", count[older]+count[same])
-	for _, w := range []string{
-		want,
-		fmt.Sprintf("%v is missing: %d reference(s)", older, count[older]),
-		fmt.Sprintf("%v is missing: %d reference(s)", same, count[same]),
-	} {
-		if !strings.Contains(out, w) {
-			t.Fatalf("output missing %q:\n%s", w, out)
-		}
-	}
 }
 
 // TestAuditMaxReport checks that truncation is stated rather than silent.
 func TestAuditMaxReport(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir, nodeKey{version: 1, nonce: 7}, nodeKey{version: 1, nonce: 9})
-	db, names := openFixture(t, dir)
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir, nodeKey{version: 1, nonce: 7}, nodeKey{version: 1, nonce: 9})
+		db, names := openFixture(t, dir)
 
-	out := captureStdout(t, func() {
-		if err := auditAll(db, names, 1); err != nil {
-			t.Fatal(err)
+		out := captureStdout(t, func() {
+			if err := auditAll(db, names, 1); err != nil {
+				t.Fatal(err)
+			}
+		})
+		for _, want := range []string{"... and 1 more missing node(s) not printed", "2 dangling, 2 missing node(s)"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("output missing %q:\n%s", want, out)
+			}
 		}
 	})
-	for _, want := range []string{"... and 1 more missing node(s) not printed", "2 dangling, 2 missing node(s)"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("output missing %q:\n%s", want, out)
-		}
-	}
 }
 
-// TestUnlockedOpensAHeldDatabase holds a fixture open the way a running node
-// does and checks that only the unlocked filesystem can open it again.
+// TestUnlockedOpensAHeldDatabase holds a fixture open read-write, the way a
+// running node does, and checks that only -no-lock can open it again.
 func TestUnlockedOpensAHeldDatabase(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir)
-	path := filepath.Join(dir, "application.db")
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		path := filepath.Join(dir, "application.db")
 
-	holder, err := pebble.Open(path, &pebble.Options{ReadOnly: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer holder.Close()
+		holder, err := openDB(path, backend, true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Close()
 
-	if db, err := pebble.Open(path, &pebble.Options{ReadOnly: true}); err == nil {
-		db.Close()
-		t.Fatal("a second open succeeded while the lock was held")
-	}
+		if db, err := openDB(path, backend, false, false); err == nil {
+			db.Close()
+			t.Fatal("a second open succeeded while the lock was held")
+		}
 
-	db, err := pebble.Open(path, &pebble.Options{ReadOnly: true, FS: unlocked{vfs.Default}})
-	if err != nil {
-		t.Fatalf("unlocked open: %v", err)
-	}
-	defer db.Close()
-	if names, err := storeNames(db); err != nil || len(names) != 2 {
-		t.Fatalf("read through the unlocked open: names=%v err=%v", names, err)
-	}
+		db, err := openDB(path, backend, false, true)
+		if err != nil {
+			t.Fatalf("unlocked open: %v", err)
+		}
+		defer db.Close()
+		if names, err := storeNames(db); err != nil || len(names) != 2 {
+			t.Fatalf("read through the unlocked open: names=%v err=%v", names, err)
+		}
+	})
 }
 
 // TestWalkToAndDelete walks the latest tree to a leaf the way a write would,
 // deletes that leaf to simulate damage, and checks the walk then fails on
 // exactly that node and the audit reports exactly that node missing.
 func TestWalkToAndDelete(t *testing.T) {
-	dir := t.TempDir()
-	buildFixture(t, dir)
-	path := filepath.Join(dir, "application.db")
-	key := []byte("evm/key0042")
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		path := filepath.Join(dir, "application.db")
+		key := []byte("evm/key0042")
 
-	db, err := pebble.Open(path, &pebble.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	var leaf nodeKey
-	out := captureStdout(t, func() {
-		if leaf, err = walkTo(db, "evm", key); err != nil {
+		db, err := openDB(path, backend, true, false)
+		if err != nil {
 			t.Fatal(err)
 		}
-	})
-	if !strings.Contains(out, "leaf "+leaf.String()+" holds it") || leaf.nonce == 1 {
-		t.Fatalf("walk did not end at a leaf:\n%s", out)
-	}
-	if _, err := walkTo(db, "evm", []byte("evm/nope")); err == nil {
-		t.Fatal("walk to an absent key succeeded")
-	}
+		defer db.Close()
 
-	captureStdout(t, func() {
-		if err := deleteNode(db, "evm", leaf); err != nil {
-			t.Fatal(err)
+		var leaf nodeKey
+		out := captureStdout(t, func() {
+			if leaf, err = walkTo(db, "evm", key); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if !strings.Contains(out, "leaf "+leaf.String()+" holds it") || leaf.nonce == 1 {
+			t.Fatalf("walk did not end at a leaf:\n%s", out)
+		}
+		if _, err := walkTo(db, "evm", []byte("evm/nope")); err == nil {
+			t.Fatal("walk to an absent key succeeded")
+		}
+
+		captureStdout(t, func() {
+			if err := deleteNode(db, "evm", leaf); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if err := deleteNode(db, "evm", leaf); err == nil {
+			t.Fatal("deleting a node twice succeeded")
+		}
+		if _, err := walkTo(db, "evm", key); err == nil || !strings.Contains(err.Error(), leaf.String()+" is missing") {
+			t.Fatalf("walk after delete: %v", err)
+		}
+		out = captureStdout(t, func() {
+			if err := auditAll(db, []string{"evm"}, 5); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if want := leaf.String() + " is missing: 1 reference(s)"; !strings.Contains(out, want) {
+			t.Fatalf("audit output missing %q:\n%s", want, out)
 		}
 	})
-	if err := deleteNode(db, "evm", leaf); err == nil {
-		t.Fatal("deleting a node twice succeeded")
-	}
-	if _, err := walkTo(db, "evm", key); err == nil || !strings.Contains(err.Error(), leaf.String()+" is missing") {
-		t.Fatalf("walk after delete: %v", err)
-	}
-	out = captureStdout(t, func() {
-		if err := auditAll(db, []string{"evm"}, 5); err != nil {
-			t.Fatal(err)
-		}
-	})
-	if want := leaf.String() + " is missing: 1 reference(s)"; !strings.Contains(out, want) {
-		t.Fatalf("audit output missing %q:\n%s", want, out)
-	}
 }
 
 // TestAuditFindsRootGap covers what the reference check cannot see: a root
@@ -626,38 +690,40 @@ func TestWalkToAndDelete(t *testing.T) {
 // dangling reference -- only a hole in the versions, which is what parks the
 // pruner on "version does not exist".
 func TestAuditFindsRootGap(t *testing.T) {
-	dir := t.TempDir()
-	buildVersioned(t, dir, 12, 5, 50)
-	path := filepath.Join(dir, "application.db")
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildVersioned(t, backend, dir, 12, 5, 50)
+		path := filepath.Join(dir, "application.db")
 
-	db, err := pebble.Open(path, &pebble.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Version 6's root, with no nonce-0 stand-in: the version becomes
-	// unreadable while every reference in the tree still resolves.
-	gone := nodeKey{version: 6, nonce: 1}
-	if err := deleteNode(db, "evm", gone); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	db.Close()
-
-	db, names := openFixture(t, dir)
-	out := captureStdout(t, func() {
-		if err := auditAll(db, names, 20); err != nil {
+		db, err := openDB(path, backend, true, false)
+		if err != nil {
 			t.Fatal(err)
 		}
-	})
-	// A store with only a gap must still be named as affected.
-	for _, want := range []string{"no root record for version 6", "1 root gap(s)", "affected stores: evm"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("output missing %q:\n%s", want, out)
+		// Version 6's root, with no nonce-0 stand-in: the version becomes
+		// unreadable while every reference in the tree still resolves.
+		gone := nodeKey{version: 6, nonce: 1}
+		if err := deleteNode(db, "evm", gone); err != nil {
+			db.Close()
+			t.Fatal(err)
 		}
-	}
-	if !strings.Contains(out, "0 dangling") {
-		t.Fatalf("a missing root is not a dangling reference:\n%s", out)
-	}
+		db.Close()
+
+		db, names := openFixture(t, dir)
+		out := captureStdout(t, func() {
+			if err := auditAll(db, names, 20); err != nil {
+				t.Fatal(err)
+			}
+		})
+		// A store with only a gap must still be named as affected.
+		for _, want := range []string{"no root record for version 6", "1 root gap(s)", "affected stores: evm"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("output missing %q:\n%s", want, out)
+			}
+		}
+		if !strings.Contains(out, "0 dangling") {
+			t.Fatalf("a missing root is not a dangling reference:\n%s", out)
+		}
+	})
 }
 
 func captureStdout(t testing.TB, fn func()) string {

@@ -30,13 +30,15 @@ test — it is irreversible and opens the database read-write.
 `-store evm` restricts `-audit` and `-nodekey` to one store, and tells `-decode`
 which layout to read its tree key under.
 
-The node must be stopped: pebble locks the directory even in read-only mode.
-Point `-db` at a snapshot or a copy, or pass `-no-lock` to read the running
-node's database in place: nothing is written, so the node is unaffected, but a
-compaction can remove a file under the scan and fail it. `-audit` and
-`-nodekey` read every node once and are disk bound, so on a mainnet database
-expect hours; `-audit` also holds 8 bytes of memory per node of the largest
-store.
+The database is pebble or goleveldb, read off its directory unless `-backend`
+says which.
+
+The node must be stopped: both lock the directory even in read-only mode. Point
+`-db` at a snapshot or a copy, or pass `-no-lock` to read the running node's
+database in place: nothing is written, so the node is unaffected, but a
+compaction can remove a file under the scan and fail it. `-audit` and `-nodekey`
+read every node once and are disk bound, so on a mainnet database expect hours;
+`-audit` also holds 8 bytes of memory per node of the largest store.
 
 `-audit` is the one to start with:
 
@@ -57,7 +59,7 @@ the same missing child once per version. One missing node is surgical, what a
 targeted delete looks like; many is a prune gone wrong or bulk loss. The tree
 key names the module data under the damaged branch. To tell a delete from a
 lost write, `pebble find` on the missing node key shows whether a `DEL`
-tombstone survives.
+tombstone survives; goleveldb has no such tool.
 
 ## Tree keys
 

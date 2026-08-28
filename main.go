@@ -13,15 +13,11 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
 )
 
 const (
@@ -45,8 +41,12 @@ func (nk nodeKey) bytes() []byte {
 	return binary.BigEndian.AppendUint32(b, uint32(nk.nonce))   //nolint:gosec // round-trips the stored encoding
 }
 
-// find is a `pebble find` argument for this node, with the store left to fill.
+// find is the command that shows this node's record: `pebble find`, which also
+// prints a DEL tombstone, or iavlscan itself, goleveldb having no such tool.
 func (nk nodeKey) find() string {
+	if dbBackend == backendLevel {
+		return fmt.Sprintf("iavlscan -db <db> -nodekey %x%x", nodeTag, nk.bytes())
+	}
 	return fmt.Sprintf("pebble find <db> hex:<s/k:STORE/>%x%x", nodeTag, nk.bytes())
 }
 
@@ -70,10 +70,14 @@ func run() error {
 		treeK  = flag.String("treekey", "", "walk -store's latest tree down to this tree key (hex), printing the path a write takes")
 		del    = flag.String("delete", "", "delete this node (hex nodeKey) from -store to simulate damage; irreversible, the node must be stopped")
 		hrp    = flag.String("bech32", "mantra", "account prefix for addresses in tree keys; empty prints them as hex")
+		back   = flag.String("backend", backendAuto, "database format: auto, pebble or goleveldb")
 	)
 	flag.Usage = usage
 	flag.Parse()
 	bech32HRP = *hrp
+	if err := setBackend(*back); err != nil {
+		return err
+	}
 
 	if *decode != "" {
 		return decodeValue(*store, *decode)
@@ -103,7 +107,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		db, err := pebble.Open(*dbPath, &pebble.Options{})
+		db, err := openDB(*dbPath, *back, true, false)
 		if err != nil {
 			return fmt.Errorf("open %s: %w", *dbPath, err)
 		}
@@ -111,13 +115,9 @@ func run() error {
 		return deleteNode(db, *store, nk)
 	}
 
-	// ReadOnly still takes the directory LOCK, so the node has to be stopped
-	// or this pointed at a snapshot -- unless told not to take the lock.
-	opts := &pebble.Options{ReadOnly: true}
-	if *noLock {
-		opts.FS = unlocked{vfs.Default}
-	}
-	db, err := pebble.Open(*dbPath, opts)
+	// Opening read-only still takes the directory lock, so the node has to be
+	// stopped or this pointed at a snapshot -- unless told not to take it.
+	db, err := openDB(*dbPath, *back, false, *noLock)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", *dbPath, err)
 	}
@@ -155,7 +155,7 @@ func run() error {
 // walkTo descends a store's latest tree to a tree key the way a Get or Set
 // does, printing each node on the way. A node missing from that path is the
 // one the next write to the key will fail on. Returns the leaf's node key.
-func walkTo(db *pebble.DB, store string, key []byte) (nodeKey, error) {
+func walkTo(db kvDB, store string, key []byte) (nodeKey, error) {
 	nk, ok := latestRoot(db, store)
 	if !ok {
 		return nodeKey{}, fmt.Errorf("%s has no nodes", store)
@@ -195,9 +195,9 @@ func walkTo(db *pebble.DB, store string, key []byte) (nodeKey, error) {
 
 // latestRoot is the root key of the store's newest version: every version
 // writes a root record at nonce 1, so it is the highest version seen.
-func latestRoot(db *pebble.DB, store string) (nodeKey, bool) {
+func latestRoot(db kvDB, store string) (nodeKey, bool) {
 	prefix := nodePrefix(store)
-	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound(prefix)})
+	it, err := db.NewIter(prefix, upperBound(prefix))
 	if err != nil {
 		return nodeKey{}, false
 	}
@@ -208,14 +208,12 @@ func latestRoot(db *pebble.DB, store string) (nodeKey, bool) {
 
 // deleteNode removes one node, the way a bad prune would, so the failure a
 // damaged node produces can be reproduced on purpose.
-func deleteNode(db *pebble.DB, store string, nk nodeKey) error {
+func deleteNode(db kvDB, store string, nk nodeKey) error {
 	key := append(nodePrefix(store), nk.bytes()...)
-	if _, closer, err := db.Get(key); err != nil {
+	if _, err := db.Get(key); err != nil {
 		return fmt.Errorf("%s has no node %v: %w", store, nk, err)
-	} else {
-		closer.Close()
 	}
-	if err := db.Delete(key, pebble.Sync); err != nil {
+	if err := db.Delete(key); err != nil {
 		return err
 	}
 	fmt.Printf("deleted %s %v\n", store, nk)
@@ -233,9 +231,10 @@ usage:
   iavlscan -db <application.db> -store <name> -delete <hex>   (simulates damage)
   iavlscan -decode <hex> [-store <name>]
 
-The node must be stopped: pebble locks the directory even in read-only mode.
--no-lock reads a running node's database anyway. The node is unaffected, but a
-compaction can fail the scan midway; retry, or use a snapshot.
+The database is pebble or goleveldb, read off its directory unless -backend
+says which. The node must be stopped: both lock the directory even in read-only
+mode. -no-lock reads a running node's database anyway. The node is unaffected,
+but a compaction can fail the scan midway; retry, or use a snapshot.
 
 flags:
 `)
@@ -273,12 +272,9 @@ func nodePrefix(store string) []byte { return []byte(rootPrefix + store + "/" + 
 
 // eachNode calls fn for every node of one store from key `from` on, in key
 // order. The value is only valid during the call.
-func eachNode(db *pebble.DB, store string, from nodeKey, fn func(nodeKey, []byte) error) error {
+func eachNode(db kvDB, store string, from nodeKey, fn func(nodeKey, []byte) error) error {
 	prefix := nodePrefix(store)
-	it, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: append(nodePrefix(store), from.bytes()...),
-		UpperBound: upperBound(prefix),
-	})
+	it, err := db.NewIter(append(nodePrefix(store), from.bytes()...), upperBound(prefix))
 	if err != nil {
 		return err
 	}
@@ -308,7 +304,7 @@ func eachNode(db *pebble.DB, store string, from nodeKey, fn func(nodeKey, []byte
 // nodes: two children per inner node, one pointer per reference root. Legacy
 // children are addressed by hash and skipped. The parent node's slices are
 // only valid during the call.
-func eachRef(db *pebble.DB, store string, from nodeKey, fn func(parent nodeKey, r reference, n node) error) error {
+func eachRef(db kvDB, store string, from nodeKey, fn func(parent nodeKey, r reference, n node) error) error {
 	buf := make([]reference, 0, 2)
 	return eachNode(db, store, from, func(parent nodeKey, val []byte) error {
 		n, ok := decodeNode(val)
@@ -329,9 +325,9 @@ func eachRef(db *pebble.DB, store string, from nodeKey, fn func(parent nodeKey, 
 
 // storeNames walks the s/k: range, skipping each store's contents once its
 // name is known ('/'+1 == '0'), so this costs one seek per store.
-func storeNames(db *pebble.DB) ([]string, error) {
+func storeNames(db kvDB) ([]string, error) {
 	prefix := []byte(rootPrefix)
-	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound(prefix)})
+	it, err := db.NewIter(prefix, upperBound(prefix))
 	if err != nil {
 		return nil, err
 	}
@@ -354,10 +350,10 @@ func storeNames(db *pebble.DB) ([]string, error) {
 
 // listRanges prints the first and last node key of each store. Two seeks per
 // store, no scan.
-func listRanges(db *pebble.DB, names []string) error {
+func listRanges(db kvDB, names []string) error {
 	for _, name := range names {
 		prefix := nodePrefix(name)
-		it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound(prefix)})
+		it, err := db.NewIter(prefix, upperBound(prefix))
 		if err != nil {
 			return err
 		}
@@ -378,7 +374,7 @@ func listRanges(db *pebble.DB, names []string) error {
 }
 
 // edgeNode returns the first node key found from one end of the range.
-func edgeNode(it *pebble.Iterator, start, step func() bool, prefixLen int) (nodeKey, bool) {
+func edgeNode(it kvIter, start, step func() bool, prefixLen int) (nodeKey, bool) {
 	for ok := start(); ok; ok = step() {
 		if k := it.Key(); len(k) == prefixLen+nodeKeyLen {
 			return decodeNodeKey(k[prefixLen:]), true
@@ -390,7 +386,7 @@ func edgeNode(it *pebble.Iterator, start, step func() bool, prefixLen int) (node
 // findParents answers two questions about the target: is it in any store, and
 // who references it. A reference from a store the target is absent from is
 // dangling.
-func findParents(db *pebble.DB, names []string, target nodeKey) error {
+func findParents(db kvDB, names []string, target nodeKey) error {
 	present := map[string]bool{}
 	for _, name := range names {
 		if n, ok := getNode(db, name, target); ok {
@@ -482,7 +478,7 @@ type missingNode struct {
 // so it happens in String, which report only calls for the lines it prints.
 type placed struct {
 	missingNode
-	db    *pebble.DB
+	db    kvDB
 	store string
 }
 
@@ -520,7 +516,7 @@ func groupMissing(found []dangling) []missingNode {
 // isolated (one bad prune decision) or widespread (bulk loss). It is disk
 // bound: one pass over every node, and 8 bytes of memory per node of the
 // largest store.
-func auditAll(db *pebble.DB, names []string, maxReport int) error {
+func auditAll(db kvDB, names []string, maxReport int) error {
 	var (
 		totalRefs, totalDangling, totalMissing, totalGaps int
 		hitStores                                         []string
@@ -564,15 +560,15 @@ func auditAll(db *pebble.DB, names []string, maxReport int) error {
 }
 
 // auditStore checks every reference of one store in a single pass, packing
-// node keys into a sorted array as it goes (pebble yields them in order, and
-// both fields are big-endian).
+// node keys into a sorted array as it goes (the iteration yields them in key
+// order, and both fields are big-endian).
 //
 // A child is created no later than its parent, and within one version parents
 // take lower nonces than children (saveNewNodes assigns them pre-order). So in
 // key order a reference to an older version always finds its node already in
 // the array, and a same-version reference only has to wait until the version
 // ends. Nothing needs a second pass.
-func auditStore(db *pebble.DB, store string) (a storeAudit, err error) {
+func auditStore(db kvDB, store string) (a storeAudit, err error) {
 	var (
 		keys    []uint64
 		buf     = make([]reference, 0, 2)
@@ -636,20 +632,19 @@ func auditStore(db *pebble.DB, store string) (a storeAudit, err error) {
 
 // getNode fetches and decodes one node, with nodeDB.GetNode's fallback from a
 // missing (v,1) to the reformatted root (v,0).
-func getNode(db *pebble.DB, store string, nk nodeKey) (node, bool) {
-	val, closer, err := db.Get(append(nodePrefix(store), nk.bytes()...))
+func getNode(db kvDB, store string, nk nodeKey) (node, bool) {
+	val, err := db.Get(append(nodePrefix(store), nk.bytes()...))
 	if err != nil && nk.nonce == 1 {
 		return getNode(db, store, nodeKey{version: nk.version})
 	}
 	if err != nil {
 		return node{}, false
 	}
-	defer closer.Close()
 	return decodeNode(val)
 }
 
 // whereOf is where(getNode(...)) for a report, "?" if the node cannot be read.
-func whereOf(db *pebble.DB, store string, nk nodeKey) string {
+func whereOf(db kvDB, store string, nk nodeKey) string {
 	if n, ok := getNode(db, store, nk); ok {
 		return where(store, n)
 	}
@@ -894,18 +889,6 @@ func decodeBytes(buf []byte) (val, rest []byte, ok bool) {
 	}
 	return buf[n : n+int(l)], buf[n+int(l):], true
 }
-
-// unlocked is a filesystem whose directory lock is a no-op, to read a database
-// a running node holds open. ReadOnly writes nothing, so the node is unaffected;
-// a compaction can delete a file under the reader, which fails the scan rather
-// than skewing it.
-type unlocked struct{ vfs.FS }
-
-func (unlocked) Lock(string) (io.Closer, error) { return nopCloser{}, nil }
-
-type nopCloser struct{}
-
-func (nopCloser) Close() error { return nil }
 
 // upperBound is the exclusive end of a prefix range.
 func upperBound(prefix []byte) []byte {
