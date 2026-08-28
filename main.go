@@ -42,9 +42,9 @@ func (nk nodeKey) bytes() []byte {
 }
 
 // find is the command that shows this node's record: `pebble find`, which also
-// prints a DEL tombstone, or iavlscan itself, goleveldb having no such tool.
+// prints a DEL tombstone, or iavlscan's own lookup on the other backends.
 func (nk nodeKey) find() string {
-	if dbBackend == backendLevel {
+	if dbBackend != backendPebble {
 		return fmt.Sprintf("iavlscan -db <db> -nodekey %x%x", nodeTag, nk.bytes())
 	}
 	return fmt.Sprintf("pebble find <db> hex:<s/k:STORE/>%x%x", nodeTag, nk.bytes())
@@ -70,7 +70,7 @@ func run() error {
 		treeK  = flag.String("treekey", "", "walk -store's latest tree down to this tree key (hex), printing the path a write takes")
 		del    = flag.String("delete", "", "delete this node (hex nodeKey) from -store to simulate damage; irreversible, the node must be stopped")
 		hrp    = flag.String("bech32", "mantra", "account prefix for addresses in tree keys; empty prints them as hex")
-		back   = flag.String("backend", backendAuto, "database format: auto, pebble or goleveldb")
+		back   = flag.String("backend", backendAuto, "database format: auto, pebble, goleveldb or rocksdb")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -231,10 +231,13 @@ usage:
   iavlscan -db <application.db> -store <name> -delete <hex>   (simulates damage)
   iavlscan -decode <hex> [-store <name>]
 
-The database is pebble or goleveldb, read off its directory unless -backend
-says which. The node must be stopped: both lock the directory even in read-only
-mode. -no-lock reads a running node's database anyway. The node is unaffected,
-but a compaction can fail the scan midway; retry, or use a snapshot.
+The database is pebble, goleveldb or rocksdb, read off its directory unless
+-backend says which. Rocksdb needs a build with -tags rocksdb.
+
+Pebble and goleveldb lock the directory even in read-only mode, so the node
+must be stopped, or -no-lock passed to read its database anyway; rocksdb takes
+no lock to read. The node is unaffected either way, but a compaction can fail
+the scan midway; retry, or use a snapshot.
 
 flags:
 `)

@@ -26,7 +26,13 @@ const (
 	backendAuto   = "auto"
 	backendPebble = "pebble"
 	backendLevel  = "goleveldb"
+	backendRocks  = "rocksdb"
 )
+
+func unknownBackend(name string) error {
+	return fmt.Errorf("unknown -backend %q; want %s, %s, %s or %s",
+		name, backendAuto, backendPebble, backendLevel, backendRocks)
+}
 
 // dbBackend is the format in force. Only the `find` hints read it, and -decode
 // prints those with no database open, hence a default rather than empty.
@@ -61,12 +67,11 @@ type kvIter interface {
 // database, so its hints have only this to go on.
 func setBackend(name string) error {
 	switch name {
-	case backendPebble, backendLevel:
+	case backendPebble, backendLevel, backendRocks:
 		dbBackend = name
 	case backendAuto:
 	default:
-		return fmt.Errorf("unknown -backend %q; want %s, %s or %s",
-			name, backendAuto, backendPebble, backendLevel)
+		return unknownBackend(name)
 	}
 	return nil
 }
@@ -84,16 +89,21 @@ func openDB(path, backend string, write, noLock bool) (kvDB, error) {
 	}
 	dbBackend = backend
 	noLock = noLock && !write
-	if backend == backendLevel {
+	switch backend {
+	case backendPebble:
+		return openPebble(path, write, noLock)
+	case backendLevel:
 		return openLevel(path, write, noLock)
+	case backendRocks:
+		return openRocks(path, write, noLock)
 	}
-	return openPebble(path, write, noLock)
+	return nil, unknownBackend(backend)
 }
 
-// detectBackend reads the directory listing. Pebble writes an OPTIONS file on
-// every open and a MARKER for its format version, neither of which goleveldb
-// has; table names decide nothing, goleveldb having written .sst too before
-// v1.14. So CURRENT only counts once pebble is ruled out.
+// detectBackend reads the directory listing, taking each backend's own file
+// before the ones it shares: IDENTITY is rocksdb's alone and MARKER pebble's,
+// though both write OPTIONS, and only goleveldb is left to claim CURRENT.
+// Table names settle nothing, goleveldb having written .sst too before v1.14.
 func detectBackend(path string) (string, error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -102,7 +112,9 @@ func detectBackend(path string) (string, error) {
 	var isPebble, isLevel bool
 	for _, e := range entries {
 		switch name := e.Name(); {
-		case strings.HasPrefix(name, "OPTIONS-"), strings.HasPrefix(name, "MARKER."):
+		case name == "IDENTITY":
+			return backendRocks, nil
+		case strings.HasPrefix(name, "MARKER."), strings.HasPrefix(name, "OPTIONS-"):
 			isPebble = true
 		case name == "CURRENT", strings.HasSuffix(name, ".ldb"):
 			isLevel = true
@@ -114,7 +126,7 @@ func detectBackend(path string) (string, error) {
 	case isLevel:
 		return backendLevel, nil
 	}
-	return "", errors.New("not a pebble or goleveldb directory; pass -backend to say which")
+	return "", errors.New("not a pebble, goleveldb or rocksdb directory; pass -backend to say which")
 }
 
 func openPebble(path string, write, noLock bool) (kvDB, error) {

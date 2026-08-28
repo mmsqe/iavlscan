@@ -20,11 +20,24 @@ import (
 const accRoot = "0c421501f1829676db577682e944fc3493d451b67ff3e29f20" +
 	"2d8f346f5fb182037ba090b1524bad5512a9147c958b096d79649709b0daf9070002040242"
 
-// eachBackend runs fn against both formats a node writes application.db in;
+// newRocksDB is filled in only by the build carrying -tags rocksdb, so it
+// doubles as whether this one can reach the backend.
+var newRocksDB func(dir string) (dbm.DB, error)
+
+// testBackends are the formats this build can open.
+func testBackends() []string {
+	b := []string{backendPebble, backendLevel}
+	if newRocksDB != nil {
+		b = append(b, backendRocks)
+	}
+	return b
+}
+
+// eachBackend runs fn against every format a node writes application.db in;
 // the scans must not be able to tell them apart.
 func eachBackend(t *testing.T, fn func(t *testing.T, backend string)) {
 	t.Helper()
-	for _, backend := range []string{backendPebble, backendLevel} {
+	for _, backend := range testBackends() {
 		t.Run(backend, func(t *testing.T) { fn(t, backend) })
 	}
 }
@@ -36,9 +49,12 @@ func newFixtureDB(t testing.TB, backend, dir string) dbm.DB {
 		db  dbm.DB
 		err error
 	)
-	if backend == backendLevel {
+	switch backend {
+	case backendLevel:
 		db, err = dbm.NewGoLevelDB("application", dir, nil)
-	} else {
+	case backendRocks:
+		db, err = newRocksDB(dir)
+	default:
 		db, err = dbm.NewPebbleDB("application", dir, nil)
 	}
 	if err != nil {
@@ -168,12 +184,27 @@ func TestDetectBackend(t *testing.T) {
 		}
 	})
 
-	// An empty directory names neither, and must say so rather than guess.
+	// An empty directory names none of them, and must say so rather than guess.
 	if _, err := detectBackend(t.TempDir()); err == nil {
 		t.Fatal("an empty directory was detected as a database")
 	}
-	if err := setBackend("rocksdb"); err == nil {
-		t.Fatal("-backend rocksdb was accepted")
+	if err := setBackend("boltdb"); err == nil {
+		t.Fatal("-backend boltdb was accepted")
+	}
+
+	// rocksdb is a name iavlscan always knows, so a build without the tag says
+	// what is missing rather than calling the database unreadable; only opening
+	// one is gated.
+	if err := setBackend(backendRocks); err != nil {
+		t.Fatalf("-backend rocksdb rejected: %v", err)
+	}
+	dbBackend = backendPebble // it is global; leave it as found
+	_, err := openRocks(t.TempDir(), false, false)
+	if err == nil {
+		t.Fatal("opened an empty directory as rocksdb")
+	}
+	if asksForTag := strings.Contains(err.Error(), "-tags rocksdb"); asksForTag == (newRocksDB != nil) {
+		t.Fatalf("openRocks error %q does not match the build", err)
 	}
 }
 
@@ -605,7 +636,9 @@ func TestAuditMaxReport(t *testing.T) {
 }
 
 // TestUnlockedOpensAHeldDatabase holds a fixture open read-write, the way a
-// running node does, and checks that only -no-lock can open it again.
+// running node does. Pebble and goleveldb then refuse a reader until -no-lock
+// skips the directory lock; rocksdb never takes one to read. Either way the
+// read has to land, which is what -no-lock exists for.
 func TestUnlockedOpensAHeldDatabase(t *testing.T) {
 	eachBackend(t, func(t *testing.T, backend string) {
 		dir := t.TempDir()
@@ -618,12 +651,15 @@ func TestUnlockedOpensAHeldDatabase(t *testing.T) {
 		}
 		defer holder.Close()
 
-		if db, err := openDB(path, backend, false, false); err == nil {
+		db, err := openDB(path, backend, false, false)
+		if locks := backend != backendRocks; locks != (err != nil) {
+			t.Fatalf("plain read-only open while held: err=%v, want refused=%v", err, locks)
+		}
+		if db != nil {
 			db.Close()
-			t.Fatal("a second open succeeded while the lock was held")
 		}
 
-		db, err := openDB(path, backend, false, true)
+		db, err = openDB(path, backend, false, true)
 		if err != nil {
 			t.Fatalf("unlocked open: %v", err)
 		}

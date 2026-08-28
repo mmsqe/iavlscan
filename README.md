@@ -30,15 +30,29 @@ test — it is irreversible and opens the database read-write.
 `-store evm` restricts `-audit` and `-nodekey` to one store, and tells `-decode`
 which layout to read its tree key under.
 
-The database is pebble or goleveldb, read off its directory unless `-backend`
-says which.
+The database is pebble, goleveldb or rocksdb, read off its directory unless
+`-backend` says which. Rocksdb needs cgo, so it sits behind a build tag; a build
+without it still names a rocksdb database rather than calling it unreadable.
 
-The node must be stopped: both lock the directory even in read-only mode. Point
-`-db` at a snapshot or a copy, or pass `-no-lock` to read the running node's
-database in place: nothing is written, so the node is unaffected, but a
-compaction can remove a file under the scan and fail it. `-audit` and `-nodekey`
-read every node once and are disk bound, so on a mainnet database expect hours;
-`-audit` also holds 8 bytes of memory per node of the largest store.
+```sh
+nix profile install nixpkgs#rocksdb_9_10
+export CGO_CFLAGS="-I$HOME/.nix-profile/include"
+export CGO_LDFLAGS="-L$HOME/.nix-profile/lib"
+go build -tags "rocksdb grocksdb_clean_link" -o iavlscan .
+```
+
+Both tags earn their place: the pinned grocksdb compiles against rocksdb 9.x —
+the pairing mantrachain builds with — not 10.x, and `grocksdb_clean_link` leaves
+`-lsnappy -lzstd -llz4 -lz` to the rocksdb library, which nix has already
+pointed at its own store paths.
+
+The node must be stopped: pebble and goleveldb lock the directory even in
+read-only mode. Point `-db` at a snapshot or a copy, or pass `-no-lock` to read
+the running node's database in place; rocksdb takes no lock to read. Nothing is
+written either way, so the node is unaffected, but a compaction can remove a
+file under the scan and fail it. `-audit` and `-nodekey` read every node once
+and are disk bound, so on a mainnet database expect hours; `-audit` also holds
+8 bytes of memory per node of the largest store.
 
 `-audit` is the one to start with:
 
@@ -59,7 +73,7 @@ the same missing child once per version. One missing node is surgical, what a
 targeted delete looks like; many is a prune gone wrong or bulk loss. The tree
 key names the module data under the damaged branch. To tell a delete from a
 lost write, `pebble find` on the missing node key shows whether a `DEL`
-tombstone survives; goleveldb has no such tool.
+tombstone survives; on the other two the report points at `-nodekey` instead.
 
 ## Tree keys
 
