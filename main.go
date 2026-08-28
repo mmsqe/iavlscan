@@ -20,8 +20,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 const (
@@ -103,7 +103,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		db, err := pebble.Open(*dbPath, &pebble.Options{})
+		db, err := pebble.Open(*dbPath, reportCorruption(&pebble.Options{}))
 		if err != nil {
 			return fmt.Errorf("open %s: %w", *dbPath, err)
 		}
@@ -113,7 +113,7 @@ func run() error {
 
 	// ReadOnly still takes the directory LOCK, so the node has to be stopped
 	// or this pointed at a snapshot -- unless told not to take the lock.
-	opts := &pebble.Options{ReadOnly: true}
+	opts := reportCorruption(&pebble.Options{ReadOnly: true})
 	if *noLock {
 		opts.FS = unlocked{vfs.Default}
 	}
@@ -893,6 +893,19 @@ func decodeBytes(buf []byte) (val, rest []byte, ok bool) {
 		return nil, nil, false
 	}
 	return buf[n : n+int(l)], buf[n+int(l):], true
+}
+
+// reportCorruption keeps a damaged block from ending the scan. Pebble's
+// default DataCorruption handler is Logger.Fatalf, which is right for a node
+// but not for the tool sent to find out how far the damage goes: note it and
+// let the read error travel back to the caller, which reports it in place.
+func reportCorruption(opts *pebble.Options) *pebble.Options {
+	opts.EventListener = &pebble.EventListener{
+		DataCorruption: func(info pebble.DataCorruptionInfo) {
+			fmt.Fprintf(os.Stderr, "on-disk corruption: %s: %v\n", info.Path, info.Details)
+		},
+	}
+	return opts
 }
 
 // unlocked is a filesystem whose directory lock is a no-op, to read a database
