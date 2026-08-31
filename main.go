@@ -36,9 +36,11 @@ type nodeKey struct {
 func (nk nodeKey) String() string { return fmt.Sprintf("(v%d,n%d)", nk.version, nk.nonce) }
 
 // bytes returns the 12 bytes as stored.
-func (nk nodeKey) bytes() []byte {
-	b := binary.BigEndian.AppendUint64(nil, uint64(nk.version)) //nolint:gosec // round-trips the stored encoding
-	return binary.BigEndian.AppendUint32(b, uint32(nk.nonce))   //nolint:gosec // round-trips the stored encoding
+func (nk nodeKey) bytes() [nodeKeyLen]byte {
+	var b [nodeKeyLen]byte
+	binary.BigEndian.PutUint64(b[:8], uint64(nk.version)) //nolint:gosec // round-trips the stored encoding
+	binary.BigEndian.PutUint32(b[8:], uint32(nk.nonce))   //nolint:gosec // round-trips the stored encoding
+	return b
 }
 
 // find is the command that shows this node's record: `pebble find`, which also
@@ -209,7 +211,7 @@ func latestRoot(db kvDB, store string) (nodeKey, bool) {
 // deleteNode removes one node, the way a bad prune would, so the failure a
 // damaged node produces can be reproduced on purpose.
 func deleteNode(db kvDB, store string, nk nodeKey) error {
-	key := append(nodePrefix(store), nk.bytes()...)
+	key := nodeDBKey(store, nk)
 	if _, err := db.Get(key); err != nil {
 		return fmt.Errorf("%s has no node %v: %w", store, nk, err)
 	}
@@ -273,11 +275,20 @@ func decodeNodeKey(b []byte) nodeKey {
 // nodePrefix is the key prefix under which one store's nodes live.
 func nodePrefix(store string) []byte { return []byte(rootPrefix + store + "/" + string(nodeTag)) }
 
+// nodeDBKey is the stored key of one node: its store's prefix then the node key.
+func nodeDBKey(store string, nk nodeKey) []byte {
+	prefix, b := nodePrefix(store), nk.bytes()
+	key := make([]byte, len(prefix)+len(b))
+	copy(key, prefix)
+	copy(key[len(prefix):], b[:])
+	return key
+}
+
 // eachNode calls fn for every node of one store from key `from` on, in key
 // order. The value is only valid during the call.
 func eachNode(db kvDB, store string, from nodeKey, fn func(nodeKey, []byte) error) error {
 	prefix := nodePrefix(store)
-	it, err := db.NewIter(append(nodePrefix(store), from.bytes()...), upperBound(prefix))
+	it, err := db.NewIter(nodeDBKey(store, from), upperBound(prefix))
 	if err != nil {
 		return err
 	}
@@ -636,7 +647,7 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 // getNode fetches and decodes one node, with nodeDB.GetNode's fallback from a
 // missing (v,1) to the reformatted root (v,0).
 func getNode(db kvDB, store string, nk nodeKey) (node, bool) {
-	val, err := db.Get(append(nodePrefix(store), nk.bytes()...))
+	val, err := db.Get(nodeDBKey(store, nk))
 	if err != nil && nk.nonce == 1 {
 		return getNode(db, store, nodeKey{version: nk.version})
 	}

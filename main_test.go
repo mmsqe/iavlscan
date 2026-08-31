@@ -87,7 +87,7 @@ func buildFixture(t *testing.T, backend, dir string, damage ...nodeKey) {
 
 	// Remove evm nodes the tree still references, the way a bad prune would.
 	for _, nk := range damage {
-		if err := db.DeleteSync(append(nodePrefix("evm"), nk.bytes()...)); err != nil {
+		if err := db.DeleteSync(nodeDBKey("evm", nk)); err != nil {
 			t.Fatalf("damage %v: %v", nk, err)
 		}
 	}
@@ -114,7 +114,7 @@ func buildVersioned(t testing.TB, backend, dir string, versions, updates, keyspa
 		}
 	}
 	for _, nk := range damage {
-		if err := db.DeleteSync(append(nodePrefix("evm"), nk.bytes()...)); err != nil {
+		if err := db.DeleteSync(nodeDBKey("evm", nk)); err != nil {
 			t.Fatalf("damage %v: %v", nk, err)
 		}
 	}
