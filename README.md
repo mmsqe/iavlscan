@@ -53,8 +53,8 @@ the running node's database in place; rocksdb takes no lock to read. Nothing is
 written either way, so the node is unaffected, but a compaction can remove a
 file under the scan and fail it. `-audit` and `-nodekey` read every node once
 and are disk bound, so on a mainnet database expect hours. `-jobs` scans that
-many stores at once, which is what shortens it; each costs 8 bytes of memory per
-node of the store it is reading.
+many stores at once, which is what shortens both; an `-audit` job also holds
+8 bytes of memory per node of its store.
 
 `-audit` is the one to start with:
 

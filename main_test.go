@@ -391,7 +391,7 @@ func TestFindParents(t *testing.T) {
 
 		// Every nonce but the root's is some node's child, once per store.
 		out := captureStdout(t, func() {
-			if err := findParents(db, names, nodeKey{version: 1, nonce: 7}); err != nil {
+			if err := findParents(db, names, nodeKey{version: 1, nonce: 7}, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -403,7 +403,7 @@ func TestFindParents(t *testing.T) {
 
 		// A root is referenced by nobody.
 		out = captureStdout(t, func() {
-			if err := findParents(db, names, nodeKey{version: 1, nonce: 1}); err != nil {
+			if err := findParents(db, names, nodeKey{version: 1, nonce: 1}, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -563,7 +563,7 @@ func TestAuditFindsDamage(t *testing.T) {
 
 		// The targeted scan must reach the same verdict per store.
 		out = captureStdout(t, func() {
-			if err := findParents(db, names, nodeKey{version: 1, nonce: 7}); err != nil {
+			if err := findParents(db, names, nodeKey{version: 1, nonce: 7}, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -626,7 +626,7 @@ func TestAuditMultiVersion(t *testing.T) {
 		// findParents starts its scan at the target's version; it must still see
 		// every parent, which all live at that version or later.
 		out = captureStdout(t, func() {
-			if err := findParents(db, names, older); err != nil {
+			if err := findParents(db, names, older, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -651,6 +651,32 @@ func TestAuditMultiVersion(t *testing.T) {
 		} {
 			if !strings.Contains(out, w) {
 				t.Fatalf("output missing %q:\n%s", w, out)
+			}
+		}
+	})
+}
+
+// TestFindParentsParallel holds -nodekey to the same bar: the report with
+// stores scanned at once must match the sequential one byte for byte.
+func TestFindParentsParallel(t *testing.T) {
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir, nodeKey{version: 1, nonce: 7})
+		db, names := openFixture(t, dir)
+
+		one := captureStdout(t, func() {
+			if err := findParents(db, names, nodeKey{version: 1, nonce: 7}, 1); err != nil {
+				t.Fatal(err)
+			}
+		})
+		for _, jobs := range []int{0, 2, 8} {
+			many := captureStdout(t, func() {
+				if err := findParents(db, names, nodeKey{version: 1, nonce: 7}, jobs); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if many != one {
+				t.Fatalf("-jobs %d changed the report:\n%s\nwant:\n%s", jobs, many, one)
 			}
 		}
 	})

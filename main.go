@@ -14,6 +14,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,7 +32,7 @@ func run() error {
 		rawKey = flag.String("nodekey", "", "find the parents of this node; hex as printed in the error")
 		audit  = flag.Bool("audit", false, "check every reference in every store, reporting dangling ones")
 		maxRep = flag.Int("max-report", 20, "with -audit, dangling references to print per store")
-		jobs   = flag.Int("jobs", 1, "with -audit, stores to scan at once; each one holds its own node index in memory")
+		jobs   = flag.Int("jobs", 1, "stores to scan at once for -audit and -nodekey; each -audit job holds its own node index in memory")
 		list   = flag.Bool("list", false, "print each store's node key range")
 		store  = flag.String("store", "", "restrict -audit and -nodekey to one store, and read -decode's tree key under it")
 		decode = flag.String("decode", "", "decode one node value, hex as printed by `pebble find`; needs no -db")
@@ -116,7 +118,7 @@ func run() error {
 		_, err = walkTo(db, *store, key)
 		return err
 	default:
-		return findParents(db, names, target)
+		return findParents(db, names, target, *jobs)
 	}
 }
 
@@ -267,6 +269,55 @@ func eachRef(db kvDB, store string, from nodeKey, fn func(parent nodeKey, r refe
 	})
 }
 
+// scanStores runs scan over the stores, jobs at a time. Stores share nothing,
+// so a disk that answers several reads at once finishes several stores in the
+// time one took. Each result reaches emit in store order as soon as its own
+// scan lands, so a run of hours still says where it has got to.
+func scanStores[T any](names []string, jobs int, scan func(string) (T, error), emit func(string, T) error) error {
+	type result struct {
+		val  T
+		err  error
+		done chan struct{}
+	}
+	var (
+		results = make([]result, len(names))
+		sem     = make(chan struct{}, max(jobs, 1))
+		stopped atomic.Bool
+		wg      sync.WaitGroup
+	)
+	// A scan still reading must not outlive the database it is reading, so an
+	// early return waits for whatever is in flight.
+	defer wg.Wait()
+	for i, name := range names {
+		r := &results[i]
+		r.done = make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(r.done)
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// Nothing queued behind a failure is worth reading, which is also
+			// what keeps -jobs 1 stopping exactly where a plain loop would.
+			if stopped.Load() {
+				return
+			}
+			r.val, r.err = scan(name)
+		}()
+	}
+	for i, name := range names {
+		<-results[i].done
+		if results[i].err == nil {
+			results[i].err = emit(name, results[i].val)
+		}
+		if results[i].err != nil {
+			stopped.Store(true)
+			return results[i].err
+		}
+	}
+	return nil
+}
+
 // storeNames walks the s/k: range, skipping each store's contents once its
 // name is known ('/'+1 == '0'), so this costs one seek per store.
 func storeNames(db kvDB) ([]string, error) {
@@ -329,8 +380,9 @@ func edgeNode(it kvIter, start, step func() bool, prefixLen int) (nodeKey, bool)
 
 // findParents answers two questions about the target: is it in any store, and
 // who references it. A reference from a store the target is absent from is
-// dangling.
-func findParents(db kvDB, names []string, target nodeKey) error {
+// dangling. -jobs stores are scanned at once; unlike the audit, a scan here
+// holds only its report lines, so extra jobs cost nothing worth counting.
+func findParents(db kvDB, names []string, target nodeKey, jobs int) error {
 	present := map[string]bool{}
 	for _, name := range names {
 		if n, ok := getNode(db, name, target); ok {
@@ -343,28 +395,48 @@ func findParents(db kvDB, names []string, target nodeKey) error {
 	}
 
 	fmt.Printf("\n== references to %v ==\n", target)
+	type parentScan struct {
+		scanned, hits, dangling int
+		lines                   []string
+	}
 	var scanned, hits, dangling int
-	for _, name := range names {
+	err := scanStores(names, jobs, func(name string) (parentScan, error) {
+		var s parentScan
 		// A parent is never older than its child, so nothing before the
 		// target's version can reference it.
 		from := nodeKey{version: target.version}
 		err := eachRef(db, name, from, func(parent nodeKey, r reference, n node) error {
-			scanned++
+			s.scanned++
 			if r.nk != target {
 				return nil
 			}
-			hits++
+			s.hits++
 			note := ""
 			if !present[name] {
-				dangling++
+				s.dangling++
 				note = " (dangling)"
 			}
-			fmt.Printf("  %s: %s %s %s%s; %s\n", name, parent, r.side, target, note, where(name, n))
+			// Formatted here rather than kept: n's slices are only valid
+			// during this call.
+			s.lines = append(s.lines,
+				fmt.Sprintf("  %s: %s %s %s%s; %s", name, parent, r.side, target, note, where(name, n)))
 			return nil
 		})
 		if err != nil {
-			return fmt.Errorf("scan store %s: %w", name, err)
+			return s, fmt.Errorf("scan store %s: %w", name, err)
 		}
+		return s, nil
+	}, func(_ string, s parentScan) error {
+		for _, l := range s.lines {
+			fmt.Println(l)
+		}
+		scanned += s.scanned
+		hits += s.hits
+		dangling += s.dangling
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	fmt.Printf("\nscanned %d references, %d to %v, %d dangling\n", scanned, hits, target, dangling)
 	if hits == 0 {

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
-	"sync/atomic"
 )
 
 // versionRange is a run of versions with no root record.
@@ -110,60 +108,22 @@ func (m missingNodes) sorted() []missingNode {
 	return out
 }
 
-// scan is one store's pass, and the channel that closes when it lands.
-type scan struct {
-	audit storeAudit
-	err   error
-	done  chan struct{}
-}
-
 // auditAll checks every reference in every store, so the damage can be read as
 // isolated (one bad prune decision) or widespread (bulk loss). It is disk
 // bound: one pass over every node, and 8 bytes of memory per node of each store
-// being scanned.
-//
-// Stores share nothing, so jobs of them are scanned at once: the pass waits on
-// reads, and a disk that answers several at a time finishes several stores in
-// the time one took. The report still prints in store order, each line as its
-// own store lands, so a run of hours says where it has got to.
+// being scanned; -jobs stores are scanned at once.
 func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 	var (
 		totalRefs, totalDangling, totalMissing, totalGaps int
 		hitStores                                         []string
-
-		scans   = make([]scan, len(names))
-		sem     = make(chan struct{}, max(jobs, 1))
-		stopped atomic.Bool
-		wg      sync.WaitGroup
 	)
-	// A scan still reading must not outlive the database it is reading, so an
-	// early return waits for whatever is in flight.
-	defer wg.Wait()
-	for i, name := range names {
-		s := &scans[i]
-		s.done = make(chan struct{})
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer close(s.done)
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			// Nothing queued behind a failed store is worth reading, which is
-			// also what keeps -jobs 1 stopping exactly where it used to.
-			if stopped.Load() {
-				return
-			}
-			s.audit, s.err = auditStore(db, name)
-		}()
-	}
-
-	for i, name := range names {
-		<-scans[i].done
-		if scans[i].err != nil {
-			stopped.Store(true)
-			return fmt.Errorf("audit store %s: %w", name, scans[i].err)
+	err := scanStores(names, jobs, func(name string) (storeAudit, error) {
+		a, err := auditStore(db, name)
+		if err != nil {
+			return a, fmt.Errorf("audit store %s: %w", name, err)
 		}
-		a := scans[i].audit
+		return a, nil
+	}, func(name string, a storeAudit) error {
 		dangling := a.danglingRefs()
 		totalRefs += a.refs
 		totalDangling += dangling
@@ -172,7 +132,7 @@ func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%-9d missing=%-9d root gaps=%d\n",
 			name, a.nodes, a.refs, dangling, len(a.missing), len(a.gaps))
 		if len(a.missing) == 0 && len(a.gaps) == 0 {
-			continue
+			return nil
 		}
 		hitStores = append(hitStores, name)
 		// Nothing references a root, so the reference check cannot see one go
@@ -183,6 +143,10 @@ func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 			lines[j] = placed{m, db, name}
 		}
 		report(lines, maxReport, "missing node(s)")
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("\nchecked %d references: %d dangling, %d missing node(s), %d root gap(s), %d store(s) affected\n",
