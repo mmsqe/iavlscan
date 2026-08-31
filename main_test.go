@@ -721,6 +721,40 @@ func TestWalkToAndDelete(t *testing.T) {
 	})
 }
 
+// writeRefRoot stores at nk the record iavl writes for a version whose tree
+// did not change: the node tag then the key it points at.
+func writeRefRoot(t *testing.T, backend, dir string, nk, to nodeKey) {
+	t.Helper()
+	db := newFixtureDB(t, backend, dir)
+	defer db.Close()
+
+	b := to.bytes()
+	val := make([]byte, 1+nodeKeyLen)
+	val[0] = nodeTag
+	copy(val[1:], b[:])
+	if err := db.SetSync(nodeDBKey("evm", nk), val); err != nil {
+		t.Fatalf("write reference root %v: %v", nk, err)
+	}
+}
+
+// TestWalkToRefRootChain covers two reference roots pointing at each other.
+// nodeDB.GetRootKey takes a single hop and reads whatever it lands on as a
+// node, so the walk has to report the shape rather than follow it forever.
+func TestWalkToRefRootChain(t *testing.T) {
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		writeRefRoot(t, backend, dir, nodeKey{version: 2, nonce: 1}, nodeKey{version: 3, nonce: 1})
+		writeRefRoot(t, backend, dir, nodeKey{version: 3, nonce: 1}, nodeKey{version: 2, nonce: 1})
+		db, _ := openFixture(t, dir)
+
+		_, err := walkTo(db, "evm", []byte("evm/key0042"))
+		if err == nil || !strings.Contains(err.Error(), "pointing at another one") {
+			t.Fatalf("walk into a reference root cycle: %v", err)
+		}
+	})
+}
+
 // TestAuditFindsRootGap covers what the reference check cannot see: a root
 // record is an entry point, not anyone's child, so deleting one leaves no
 // dangling reference -- only a hole in the versions, which is what parks the

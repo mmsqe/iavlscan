@@ -163,6 +163,7 @@ func walkTo(db kvDB, store string, key []byte) (nodeKey, error) {
 		return nodeKey{}, fmt.Errorf("%s has no nodes", store)
 	}
 	fmt.Printf("== %s: path to %x ==\n", store, key)
+	var hops int
 	for {
 		n, ok := getNode(db, store, nk)
 		if !ok {
@@ -170,6 +171,11 @@ func walkTo(db kvDB, store string, key []byte) (nodeKey, error) {
 		}
 		switch {
 		case n.ref: // an unchanged version points at an earlier root
+			// nodeDB.GetRootKey takes one hop and reads whatever it lands on as
+			// a node, so a chain is a shape iavl cannot follow either.
+			if hops++; hops > 1 {
+				return nodeKey{}, fmt.Errorf("%s: %v is a reference root pointing at another one, which iavl does not resolve", store, nk)
+			}
 			nk = n.refTo
 			continue
 		case n.empty:
