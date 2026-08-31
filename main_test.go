@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -165,6 +166,25 @@ func TestStoreNames(t *testing.T) {
 		_, names := openFixture(t, dir)
 		if len(names) != 2 || names[0] != "bank" || names[1] != "evm" {
 			t.Fatalf("got %v, want [bank evm]", names)
+		}
+	})
+}
+
+// TestGetAbsentIsNotFound pins the Get contract every adapter must keep: an
+// absent key is errNotFound, so callers can tell it from a read that failed.
+// The rocksdb adapter answers off a cursor rather than rocksdb_get, so its
+// path is the one this test exists for.
+func TestGetAbsentIsNotFound(t *testing.T) {
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir)
+		db, _ := openFixture(t, dir)
+
+		if _, err := db.Get([]byte("no such key")); !errors.Is(err, errNotFound) {
+			t.Fatalf("absent key: got %v, want errNotFound", err)
+		}
+		if _, err := db.Get(nodeDBKey("evm", nodeKey{version: 1, nonce: 1})); err != nil {
+			t.Fatalf("present key: %v", err)
 		}
 	})
 }

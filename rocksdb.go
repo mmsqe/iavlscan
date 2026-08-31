@@ -6,7 +6,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 
 	"github.com/linxGnu/grocksdb"
 )
@@ -51,7 +50,11 @@ func (d rocksDB) Get(key []byte) ([]byte, error) {
 	}
 	defer it.Close()
 	if !it.First() || !bytes.Equal(it.Key(), key) {
-		return nil, fmt.Errorf("no value for key %x", key)
+		// A miss with a quiet cursor is an absent key; a noisy one failed.
+		if err := it.Error(); err != nil {
+			return nil, err
+		}
+		return nil, errNotFound
 	}
 	return bytes.Clone(it.Value()), nil
 }

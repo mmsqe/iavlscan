@@ -9,6 +9,7 @@ package main
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -139,14 +140,17 @@ func run() error {
 // does, printing each node on the way. A node missing from that path is the
 // one the next write to the key will fail on. Returns the leaf's node key.
 func walkTo(db kvDB, store string, key []byte) (nodeKey, error) {
-	nk, ok := latestRoot(db, store)
-	if !ok {
-		return nodeKey{}, fmt.Errorf("%s has no nodes", store)
+	nk, err := latestRoot(db, store)
+	if err != nil {
+		return nodeKey{}, err
 	}
 	fmt.Printf("== %s: path to %x ==\n", store, key)
 	var hops int
 	for {
-		n, ok := getNode(db, store, nk)
+		n, ok, err := getNode(db, store, nk)
+		if err != nil {
+			return nodeKey{}, fmt.Errorf("%s: read %v: %w", store, nk, err)
+		}
 		if !ok {
 			return nodeKey{}, fmt.Errorf("%s: %v is missing; a write to %x fails here", store, nk, key)
 		}
@@ -183,24 +187,33 @@ func walkTo(db kvDB, store string, key []byte) (nodeKey, error) {
 }
 
 // latestRoot is the root key of the store's newest version: every version
-// writes a root record at nonce 1, so it is the highest version seen.
-func latestRoot(db kvDB, store string) (nodeKey, bool) {
+// writes a root record at nonce 1, so it is the highest version seen. A store
+// that cannot be read reports the read failure, not an empty store.
+func latestRoot(db kvDB, store string) (nodeKey, error) {
 	prefix := nodePrefix(store)
 	it, err := db.NewIter(prefix, upperBound(prefix))
 	if err != nil {
-		return nodeKey{}, false
+		return nodeKey{}, err
 	}
 	defer it.Close()
 	last, ok := edgeNode(it, it.Last, it.Prev, len(prefix))
-	return nodeKey{version: last.version, nonce: 1}, ok
+	if err := it.Error(); err != nil {
+		return nodeKey{}, err
+	}
+	if !ok {
+		return nodeKey{}, fmt.Errorf("%s has no nodes", store)
+	}
+	return nodeKey{version: last.version, nonce: 1}, nil
 }
 
 // deleteNode removes one node, the way a bad prune would, so the failure a
 // damaged node produces can be reproduced on purpose.
 func deleteNode(db kvDB, store string, nk nodeKey) error {
 	key := nodeDBKey(store, nk)
-	if _, err := db.Get(key); err != nil {
-		return fmt.Errorf("%s has no node %v: %w", store, nk, err)
+	if _, err := db.Get(key); errors.Is(err, errNotFound) {
+		return fmt.Errorf("%s has no node %v", store, nk)
+	} else if err != nil {
+		return err
 	}
 	if err := db.Delete(key); err != nil {
 		return err
@@ -398,7 +411,11 @@ func edgeNode(it kvIter, start, step func() bool, prefixLen int) (nodeKey, bool)
 func findParents(db kvDB, names []string, target nodeKey, jobs int) error {
 	present := map[string]bool{}
 	for _, name := range names {
-		if n, ok := getNode(db, name, target); ok {
+		n, ok, err := getNode(db, name, target)
+		if err != nil {
+			return fmt.Errorf("read %v from %s: %w", target, name, err)
+		}
+		if ok {
 			present[name] = true
 			fmt.Printf("%v is present in %s, %s\n", target, name, where(name, n))
 		}
@@ -460,21 +477,26 @@ func findParents(db kvDB, names []string, target nodeKey, jobs int) error {
 }
 
 // getNode fetches and decodes one node, with nodeDB.GetNode's fallback from a
-// missing (v,1) to the reformatted root (v,0).
-func getNode(db kvDB, store string, nk nodeKey) (node, bool) {
+// missing (v,1) to the reformatted root (v,0). ok=false is a node that is
+// absent or does not decode; err is the database failing to answer.
+func getNode(db kvDB, store string, nk nodeKey) (node, bool, error) {
 	val, err := db.Get(nodeDBKey(store, nk))
-	if err != nil && nk.nonce == 1 {
-		return getNode(db, store, nodeKey{version: nk.version})
+	if errors.Is(err, errNotFound) {
+		if nk.nonce == 1 {
+			return getNode(db, store, nodeKey{version: nk.version})
+		}
+		return node{}, false, nil
 	}
 	if err != nil {
-		return node{}, false
+		return node{}, false, err
 	}
-	return decodeNode(val)
+	n, ok := decodeNode(val)
+	return n, ok, nil
 }
 
 // whereOf is where(getNode(...)) for a report, "?" if the node cannot be read.
 func whereOf(db kvDB, store string, nk nodeKey) string {
-	if n, ok := getNode(db, store, nk); ok {
+	if n, ok, err := getNode(db, store, nk); err == nil && ok {
 		return where(store, n)
 	}
 	return "?"

@@ -38,9 +38,14 @@ func unknownBackend(name string) error {
 // prints those with no database open, hence a default rather than empty.
 var dbBackend = backendPebble
 
+// errNotFound is the one Get error that means the key is absent; anything
+// else is the database failing to answer, which for this tool is a different
+// diagnosis from a missing node.
+var errNotFound = errors.New("key not found")
+
 // kvDB is the part of a key/value store the scans use.
 type kvDB interface {
-	// Get returns a copy of one key's value, or an error if it is absent.
+	// Get returns a copy of one key's value; errNotFound if it is absent.
 	Get(key []byte) ([]byte, error)
 	// NewIter walks [lower, upper); a nil upper runs to the end.
 	NewIter(lower, upper []byte) (kvIter, error)
@@ -164,6 +169,9 @@ type pebbleDB struct{ db *pebble.DB }
 // Get copies the value out: pebble's own only lives until the closer runs.
 func (d pebbleDB) Get(key []byte) ([]byte, error) {
 	val, closer, err := d.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, errNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +193,13 @@ func (d pebbleDB) Close() error            { return d.db.Close() }
 // levelDB adapts goleveldb to kvDB. Its Get already returns a copy.
 type levelDB struct{ db *leveldb.DB }
 
-func (d levelDB) Get(key []byte) ([]byte, error) { return d.db.Get(key, nil) }
+func (d levelDB) Get(key []byte) ([]byte, error) {
+	val, err := d.db.Get(key, nil)
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return nil, errNotFound
+	}
+	return val, err
+}
 
 func (d levelDB) NewIter(lower, upper []byte) (kvIter, error) {
 	return levelIter{d.db.NewIterator(&util.Range{Start: lower, Limit: upper}, nil)}, nil
