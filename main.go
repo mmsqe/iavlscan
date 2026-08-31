@@ -458,10 +458,20 @@ func (r versionRange) String() string {
 
 // storeAudit is what one store's pass found.
 type storeAudit struct {
-	nodes    int
-	refs     int
-	dangling []dangling
-	gaps     []versionRange
+	nodes   int
+	refs    int
+	missing []missingNode // what the dangling references point at, oldest first
+	gaps    []versionRange
+}
+
+// danglingRefs is how many references resolve to nothing. Each one is counted
+// against the node it points at, so the nodes carry the total between them.
+func (a storeAudit) danglingRefs() int {
+	var n int
+	for _, m := range a.missing {
+		n += m.refs
+	}
+	return n
 }
 
 // report prints up to maxReport lines, then says how many it held back. A
@@ -506,23 +516,28 @@ func (p placed) String() string {
 		whereOf(p.db, p.store, p.first.parent))
 }
 
-// groupMissing folds dangling references by the node they point at, oldest
-// node first. found is in parent key order, so a node's first reference is
-// from its earliest parent and its last from the latest.
-func groupMissing(found []dangling) []missingNode {
-	byNode := map[nodeKey]*missingNode{}
-	for _, d := range found {
-		m, ok := byNode[d.ref.nk]
-		if !ok {
-			m = &missingNode{nk: d.ref.nk, first: d}
-			byNode[d.ref.nk] = m
-		}
-		m.last = d.parent.version
-		m.refs++
+// missingNodes collects dangling references by the node they point at. A parent
+// rewritten every block points at the same missing child once per version, so
+// this holds one entry per missing node rather than one per reference.
+type missingNodes map[nodeKey]*missingNode
+
+// note records one dangling reference. They arrive in parent order, so the
+// first one seen is the oldest and the last one wins.
+func (m missingNodes) note(d dangling) {
+	n, ok := m[d.ref.nk]
+	if !ok {
+		n = &missingNode{nk: d.ref.nk, first: d}
+		m[d.ref.nk] = n
 	}
-	out := make([]missingNode, 0, len(byNode))
-	for _, m := range byNode {
-		out = append(out, *m)
+	n.last = d.parent.version
+	n.refs++
+}
+
+// sorted lays the nodes out oldest first, the order they were written in.
+func (m missingNodes) sorted() []missingNode {
+	out := make([]missingNode, 0, len(m))
+	for _, n := range m {
+		out = append(out, *n)
 	}
 	slices.SortFunc(out, func(a, b missingNode) int {
 		return cmp.Or(cmp.Compare(a.nk.version, b.nk.version), cmp.Compare(a.nk.nonce, b.nk.nonce))
@@ -532,8 +547,8 @@ func groupMissing(found []dangling) []missingNode {
 
 // auditAll checks every reference in every store, so the damage can be read as
 // isolated (one bad prune decision) or widespread (bulk loss). It is disk
-// bound: one pass over every node, and 8 bytes of memory per node of the
-// largest store.
+// bound: one pass over every node, 8 bytes of memory per node of the largest
+// store, and one entry per missing node however many references it has.
 func auditAll(db kvDB, names []string, maxReport int) error {
 	var (
 		totalRefs, totalDangling, totalMissing, totalGaps int
@@ -544,25 +559,23 @@ func auditAll(db kvDB, names []string, maxReport int) error {
 		if err != nil {
 			return fmt.Errorf("audit store %s: %w", name, err)
 		}
-		gone := groupMissing(a.dangling)
+		dangling := a.danglingRefs()
 		totalRefs += a.refs
-		totalDangling += len(a.dangling)
-		totalMissing += len(gone)
+		totalDangling += dangling
+		totalMissing += len(a.missing)
 		totalGaps += len(a.gaps)
 		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%-9d missing=%-9d root gaps=%d\n",
-			name, a.nodes, a.refs, len(a.dangling), len(gone), len(a.gaps))
-		if len(gone) == 0 && len(a.gaps) == 0 {
+			name, a.nodes, a.refs, dangling, len(a.missing), len(a.gaps))
+		if len(a.missing) == 0 && len(a.gaps) == 0 {
 			continue
 		}
 		hitStores = append(hitStores, name)
 		// Nothing references a root, so the reference check cannot see one go
 		// missing; a gap is what parks the pruner on "version does not exist".
 		report(a.gaps, maxReport, "root gap(s)")
-		// One line per missing node, not per reference: a parent rewritten
-		// every block references the same missing child once per version.
-		lines := make([]placed, len(gone))
-		for i, g := range gone {
-			lines[i] = placed{g, db, name}
+		lines := make([]placed, len(a.missing))
+		for j, m := range a.missing {
+			lines[j] = placed{m, db, name}
 		}
 		report(lines, maxReport, "missing node(s)")
 	}
@@ -592,6 +605,7 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 		buf     = make([]reference, 0, 2)
 		pending []dangling // same-version references, checked once the version is complete
 		version int64
+		byNode  = missingNodes{}
 	)
 	// hasVersion and GetRoot both look only at nonce 1, so a version above
 	// the first one carrying it, but with none of its own, is a hole the
@@ -602,7 +616,7 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 	flush := func() {
 		for _, d := range pending {
 			if !resolves(keys, d.ref.nk) {
-				a.dangling = append(a.dangling, d)
+				byNode.note(d)
 			}
 		}
 		pending = pending[:0]
@@ -635,13 +649,13 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 			case r.nk.version >= parent.version:
 				pending = append(pending, d)
 			case !resolves(keys, r.nk):
-				a.dangling = append(a.dangling, d)
+				byNode.note(d)
 			}
 		}
 		return nil
 	})
 	flush()
-	a.nodes = len(keys)
+	a.nodes, a.missing = len(keys), byNode.sorted()
 	return a, err
 }
 
