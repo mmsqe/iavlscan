@@ -49,6 +49,22 @@ func run() error {
 		return err
 	}
 
+	// Each of these flags is its own mode; two at once would silently drop
+	// one, so refuse rather than pick.
+	var modes int
+	for _, on := range []bool{*rawKey != "", *audit, *list, *treeK != "", *del != "", *decode != ""} {
+		if on {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return fmt.Errorf("-nodekey, -audit, -list, -treekey, -delete and -decode each run alone; pick one")
+	}
+	if modes == 0 {
+		flag.Usage()
+		return fmt.Errorf("one of -nodekey, -audit, -list, -treekey, -delete or -decode is required")
+	}
+
 	if *decode != "" {
 		return decodeValue(*store, *decode)
 	}
@@ -58,9 +74,6 @@ func run() error {
 		if target, err = parseNodeKey(*rawKey); err != nil {
 			return err
 		}
-	} else if !*list && !*audit && *treeK == "" && *del == "" {
-		flag.Usage()
-		return fmt.Errorf("one of -nodekey, -audit, -list, -treekey, -delete or -decode is required")
 	}
 	if *dbPath == "" {
 		flag.Usage()
