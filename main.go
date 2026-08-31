@@ -315,9 +315,8 @@ func eachNode(db kvDB, store string, from nodeKey, fn func(nodeKey, []byte) erro
 }
 
 // eachRef calls fn for every (version, nonce) reference held by one store's
-// nodes: two children per inner node, one pointer per reference root. Legacy
-// children are addressed by hash and skipped. The parent node's slices are
-// only valid during the call.
+// nodes: two children per inner node, one pointer per reference root. The
+// parent node's slices are only valid during the call.
 func eachRef(db kvDB, store string, from nodeKey, fn func(parent nodeKey, r reference, n node) error) error {
 	buf := make([]reference, 0, 2)
 	return eachNode(db, store, from, func(parent nodeKey, val []byte) error {
@@ -326,9 +325,6 @@ func eachRef(db kvDB, store string, from nodeKey, fn func(parent nodeKey, r refe
 			return nil
 		}
 		for _, r := range n.outgoing(buf) {
-			if r.legacy {
-				continue
-			}
 			if err := fn(parent, r, n); err != nil {
 				return err
 			}
@@ -625,9 +621,6 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 			return nil
 		}
 		for _, r := range n.outgoing(buf) {
-			if r.legacy {
-				continue
-			}
 			a.refs++
 			d := dangling{parent: parent, ref: r}
 			switch {
@@ -793,15 +786,21 @@ type node struct {
 	trailing    int     // bytes left over; non-zero means the decode is suspect
 }
 
-// outgoing lists the links this record holds into buf: two children for an
-// inner node, one pointer for a reference root, none otherwise.
+// outgoing lists the links this record holds by node key into buf: two children
+// for an inner node, one pointer for a reference root, none otherwise. A legacy
+// child is addressed by hash and so holds no node key to follow.
 func (n node) outgoing(buf []reference) []reference {
 	buf = buf[:0]
 	switch {
 	case n.ref:
 		buf = append(buf, reference{child{nk: n.refTo}, "reference to"})
 	case !n.leaf && !n.empty:
-		buf = append(buf, reference{n.left, "left child"}, reference{n.right, "right child"})
+		if !n.left.legacy {
+			buf = append(buf, reference{n.left, "left child"})
+		}
+		if !n.right.legacy {
+			buf = append(buf, reference{n.right, "right child"})
+		}
 	}
 	return buf
 }
