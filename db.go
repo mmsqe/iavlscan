@@ -299,3 +299,15 @@ func parseFileDesc(name string) (storage.FileDesc, bool) {
 	}
 	return storage.FileDesc{}, false
 }
+
+// upperBound is the exclusive end of a prefix range.
+func upperBound(prefix []byte) []byte {
+	ub := bytes.Clone(prefix)
+	for i := len(ub) - 1; i >= 0; i-- {
+		if ub[i] < 0xff {
+			ub[i]++
+			return ub[:i+1]
+		}
+	}
+	return nil
+}
