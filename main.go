@@ -591,17 +591,17 @@ func auditAll(db kvDB, names []string, maxReport int) error {
 }
 
 // auditStore checks every reference of one store in a single pass, packing
-// node keys into a sorted array as it goes (the iteration yields them in key
+// node keys into a sorted index as it goes (the iteration yields them in key
 // order, and both fields are big-endian).
 //
 // A child is created no later than its parent, and within one version parents
 // take lower nonces than children (saveNewNodes assigns them pre-order). So in
 // key order a reference to an older version always finds its node already in
-// the array, and a same-version reference only has to wait until the version
+// the index, and a same-version reference only has to wait until the version
 // ends. Nothing needs a second pass.
 func auditStore(db kvDB, store string) (a storeAudit, err error) {
 	var (
-		keys    []uint64
+		index   nodeIndex
 		buf     = make([]reference, 0, 2)
 		pending []dangling // same-version references, checked once the version is complete
 		version int64
@@ -615,7 +615,7 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 	var lastRoot int64
 	flush := func() {
 		for _, d := range pending {
-			if !resolves(keys, d.ref.nk) {
+			if !index.resolves(d.ref.nk) {
 				byNode.note(d)
 			}
 		}
@@ -630,7 +630,7 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 		if !ok {
 			return fmt.Errorf("node key %v does not fit the packed form", parent)
 		}
-		keys = append(keys, packed)
+		index.add(packed)
 		if parent.nonce == 1 {
 			if lastRoot != 0 && parent.version > lastRoot+1 {
 				a.gaps = append(a.gaps, versionRange{lastRoot + 1, parent.version - 1})
@@ -648,14 +648,14 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 			switch {
 			case r.nk.version >= parent.version:
 				pending = append(pending, d)
-			case !resolves(keys, r.nk):
+			case !index.resolves(r.nk):
 				byNode.note(d)
 			}
 		}
 		return nil
 	})
 	flush()
-	a.nodes, a.missing = len(keys), byNode.sorted()
+	a.nodes, a.missing = index.n, byNode.sorted()
 	return a, err
 }
 
@@ -692,24 +692,58 @@ func where(store string, n node) string {
 	return "tree key=" + describeKey(store, n.key)
 }
 
-// resolves reports whether a reference finds a node, mirroring nodeDB.GetNode:
-// a missing key whose nonce is 1 falls back to (version, 0), the reformatted
-// root deleteVersion leaves behind. Without that fallback every pruned root
-// would look dangling.
-func resolves(keys []uint64, nk nodeKey) bool {
-	if has(keys, nk) {
-		return true
-	}
-	return nk.nonce == 1 && has(keys, nodeKey{version: nk.version})
+// indexBlock is how many packed node keys one block holds. Smaller blocks keep
+// tails in cache and search faster, larger ones waste less on the part-filled
+// block; 512 is where both curves flatten.
+const indexBlock = 1 << 9
+
+// nodeIndex holds one store's packed node keys in ascending order, in blocks
+// rather than in one slice. A growing slice passes through holding both its old
+// and new self, and the largest mainnet store's index runs to hundreds of
+// megabytes, so that peak is what decides whether the audit fits in memory.
+// Blocks never move once written, at a few percent on a cached lookup.
+type nodeIndex struct {
+	blocks [][]uint64
+	// tails is each block's last key. Read off the blocks themselves they would
+	// put a cache miss in every step of the search; together they stay in cache.
+	tails []uint64
+	n     int
 }
 
-func has(keys []uint64, nk nodeKey) bool {
+// add takes the next key; the scan yields them in order, so the index sorts
+// itself.
+func (x *nodeIndex) add(packed uint64) {
+	if x.n%indexBlock == 0 {
+		x.blocks = append(x.blocks, make([]uint64, 0, indexBlock))
+		x.tails = append(x.tails, 0)
+	}
+	last := len(x.blocks) - 1
+	x.blocks[last] = append(x.blocks[last], packed)
+	x.tails[last] = packed
+	x.n++
+}
+
+// holds reports whether the index has this node key: one search for the block
+// whose last key is the first not below it, then one search inside that block.
+func (x *nodeIndex) holds(nk nodeKey) bool {
 	packed, ok := packNodeKey(nk)
 	if !ok {
 		return false // nothing in the index can match an impossible key
 	}
-	_, found := slices.BinarySearch(keys, packed)
+	i, _ := slices.BinarySearch(x.tails, packed)
+	if i == len(x.blocks) {
+		return false
+	}
+	_, found := slices.BinarySearch(x.blocks[i], packed)
 	return found
+}
+
+// resolves reports whether a reference finds a node, mirroring nodeDB.GetNode:
+// a missing key whose nonce is 1 falls back to (version, 0), the reformatted
+// root deleteVersion leaves behind. Without that fallback every pruned root
+// would look dangling.
+func (x *nodeIndex) resolves(nk nodeKey) bool {
+	return x.holds(nk) || (nk.nonce == 1 && x.holds(nodeKey{version: nk.version}))
 }
 
 // packNodeKey folds a node key into one uint64, preserving the stored order.

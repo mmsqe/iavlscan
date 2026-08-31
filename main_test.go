@@ -443,18 +443,59 @@ func TestPackNodeKey(t *testing.T) {
 	}
 }
 
+// index builds a nodeIndex from keys given in ascending order, the only order
+// the scan ever adds them in.
+func index(t *testing.T, keys ...nodeKey) *nodeIndex {
+	t.Helper()
+	x := &nodeIndex{}
+	for _, nk := range keys {
+		p, ok := packNodeKey(nk)
+		if !ok {
+			t.Fatalf("packNodeKey(%v) failed", nk)
+		}
+		x.add(p)
+	}
+	return x
+}
+
+// TestNodeIndex crosses the block seams the index is built from: every key put
+// in has to come back out, and nothing else may, whichever block it landed in.
+func TestNodeIndex(t *testing.T) {
+	// Three full blocks and part of a fourth, two nodes per version, so the
+	// seams fall inside a version as well as between two.
+	var keys []nodeKey
+	for i := range indexBlock*3 + 7 {
+		keys = append(keys, nodeKey{version: int64(i/2) + 1, nonce: int32(i%2)*2 + 1})
+	}
+	x := index(t, keys...)
+	if x.n != len(keys) || len(x.blocks) != 4 {
+		t.Fatalf("index holds %d keys in %d blocks, want %d in 4", x.n, len(x.blocks), len(keys))
+	}
+	for _, nk := range keys {
+		if !x.holds(nk) {
+			t.Fatalf("%v was added but is not held", nk)
+		}
+		// The nonces between and beyond the two stored per version were never
+		// added, and a two-level search must not find them either.
+		for _, absent := range []int32{nk.nonce - 1, nk.nonce + 1} {
+			if absent > 0 && x.holds(nodeKey{version: nk.version, nonce: absent}) {
+				t.Fatalf("(v%d,n%d) was never added but is held", nk.version, absent)
+			}
+		}
+	}
+	if last := keys[len(keys)-1]; x.holds(nodeKey{version: last.version + 1, nonce: 1}) {
+		t.Fatal("a key past the end of the last block is held")
+	}
+	if x.holds(nodeKey{version: 1, nonce: 0}) {
+		t.Fatal("a key before the start of the first block is held")
+	}
+}
+
 // TestResolves covers nodeDB.GetNode's fallback: pruning rewrites a root from
 // (v,1) to (v,0), and references to it must still resolve.
 func TestResolves(t *testing.T) {
-	pack := func(v int64, n int32) uint64 {
-		p, ok := packNodeKey(nodeKey{version: v, nonce: n})
-		if !ok {
-			t.Fatalf("packNodeKey(v%d,n%d) failed", v, n)
-		}
-		return p
-	}
 	// Version 5's root was reformatted to nonce 0; version 9 was never stored.
-	keys := []uint64{pack(5, 0), pack(7, 1), pack(7, 42)}
+	x := index(t, nodeKey{version: 5}, nodeKey{version: 7, nonce: 1}, nodeKey{version: 7, nonce: 42})
 
 	for _, tc := range []struct {
 		nk   nodeKey
@@ -468,7 +509,7 @@ func TestResolves(t *testing.T) {
 		{nodeKey{version: 5, nonce: 2}, false, "only nonce 1 gets the fallback"},
 		{nodeKey{version: -1, nonce: 1}, false, "an impossible key matches nothing"},
 	} {
-		if got := resolves(keys, tc.nk); got != tc.want {
+		if got := x.resolves(tc.nk); got != tc.want {
 			t.Fatalf("resolves(%v) = %v, want %v (%s)", tc.nk, got, tc.want, tc.why)
 		}
 	}
