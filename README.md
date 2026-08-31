@@ -14,6 +14,7 @@ iavlscan works backwards from the parents that still point at it.
 go build -o iavlscan .
 
 iavlscan -db ~/.mantrachain/data/application.db -audit               # every dangling reference
+iavlscan -db ~/.mantrachain/data/application.db -audit -jobs 4       # four stores at a time
 iavlscan -db ~/.mantrachain/data/application.db -nodekey 7300...f2   # is one node present, and who references it
 iavlscan -db ~/.mantrachain/data/application.db -list                # node key range per store
 iavlscan -decode "[0c421501f18296...0242]"                           # one node value, no database
@@ -51,8 +52,9 @@ read-only mode. Point `-db` at a snapshot or a copy, or pass `-no-lock` to read
 the running node's database in place; rocksdb takes no lock to read. Nothing is
 written either way, so the node is unaffected, but a compaction can remove a
 file under the scan and fail it. `-audit` and `-nodekey` read every node once
-and are disk bound, so on a mainnet database expect hours; `-audit` also holds
-8 bytes of memory per node of the largest store.
+and are disk bound, so on a mainnet database expect hours. `-jobs` scans that
+many stores at once, which is what shortens it; each costs 8 bytes of memory per
+node of the store it is reading.
 
 `-audit` is the one to start with:
 

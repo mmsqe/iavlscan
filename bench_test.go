@@ -38,7 +38,27 @@ func BenchmarkAuditDamaged(b *testing.B) {
 	}
 }
 
-// benchAudit times auditAll over an already-built fixture.
+// BenchmarkAuditJobs is what -jobs is for: several stores, which a real
+// application.db always has, scanned at once instead of one after another.
+func BenchmarkAuditJobs(b *testing.B) {
+	dir := b.TempDir()
+	names := buildStores(b, dir, 4, 500, 200, 50000)
+	db, _ := openFixture(b, dir)
+	for _, jobs := range []int{1, 2, 4} {
+		b.Run(fmt.Sprintf("jobs%d", jobs), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				captureStdout(b, func() {
+					if err := auditAll(db, names, 20, jobs); err != nil {
+						b.Fatal(err)
+					}
+				})
+			}
+		})
+	}
+}
+
+// benchAudit times auditAll over an already-built fixture, one store at a time.
 func benchAudit(b *testing.B, dir string) {
 	b.Helper()
 	db, names := openFixture(b, dir)
@@ -46,11 +66,38 @@ func benchAudit(b *testing.B, dir string) {
 	b.ReportAllocs()
 	for range b.N {
 		captureStdout(b, func() {
-			if err := auditAll(db, names, 20); err != nil {
+			if err := auditAll(db, names, 20, 1); err != nil {
 				b.Fatal(err)
 			}
 		})
 	}
+}
+
+// buildStores writes several stores that each grew the way buildVersioned's
+// one does, so that a pass over them has something to overlap.
+func buildStores(b *testing.B, dir string, stores, versions, updates, keyspace int) []string {
+	b.Helper()
+	db := newFixtureDB(b, backendPebble, dir)
+	defer db.Close()
+
+	names := make([]string, stores)
+	for s := range names {
+		names[s] = fmt.Sprintf("store%d", s)
+		pdb := dbm.NewPrefixDB(db, []byte(rootPrefix+names[s]+"/"))
+		tree := iavl.NewMutableTree(iavldb.NewWrapper(pdb), 0, false, iavl.NewNopLogger())
+		for v := range versions {
+			for i := range updates {
+				k := fmt.Sprintf("key%06d", (v*7919+i*104729)%keyspace)
+				if _, err := tree.Set([]byte(k), []byte{byte(v), byte(i)}); err != nil {
+					b.Fatalf("set: %v", err)
+				}
+			}
+			if _, _, err := tree.SaveVersion(); err != nil {
+				b.Fatalf("save: %v", err)
+			}
+		}
+	}
+	return names
 }
 
 // buildStable writes a wide tree once and then rewrites only a hot path for

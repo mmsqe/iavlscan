@@ -17,6 +17,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -65,6 +67,7 @@ func run() error {
 		rawKey = flag.String("nodekey", "", "find the parents of this node; hex as printed in the error")
 		audit  = flag.Bool("audit", false, "check every reference in every store, reporting dangling ones")
 		maxRep = flag.Int("max-report", 20, "with -audit, dangling references to print per store")
+		jobs   = flag.Int("jobs", 1, "with -audit, stores to scan at once; each one holds its own node index in memory")
 		list   = flag.Bool("list", false, "print each store's node key range")
 		store  = flag.String("store", "", "restrict -audit and -nodekey to one store, and read -decode's tree key under it")
 		decode = flag.String("decode", "", "decode one node value, hex as printed by `pebble find`; needs no -db")
@@ -141,7 +144,7 @@ func run() error {
 	case *list:
 		return listRanges(db, names)
 	case *audit:
-		return auditAll(db, names, *maxRep)
+		return auditAll(db, names, *maxRep, *jobs)
 	case *treeK != "":
 		key, err := hex.DecodeString(strings.TrimPrefix(*treeK, "0x"))
 		if err != nil {
@@ -545,20 +548,60 @@ func (m missingNodes) sorted() []missingNode {
 	return out
 }
 
+// scan is one store's pass, and the channel that closes when it lands.
+type scan struct {
+	audit storeAudit
+	err   error
+	done  chan struct{}
+}
+
 // auditAll checks every reference in every store, so the damage can be read as
 // isolated (one bad prune decision) or widespread (bulk loss). It is disk
-// bound: one pass over every node, 8 bytes of memory per node of the largest
-// store, and one entry per missing node however many references it has.
-func auditAll(db kvDB, names []string, maxReport int) error {
+// bound: one pass over every node, and 8 bytes of memory per node of each store
+// being scanned.
+//
+// Stores share nothing, so jobs of them are scanned at once: the pass waits on
+// reads, and a disk that answers several at a time finishes several stores in
+// the time one took. The report still prints in store order, each line as its
+// own store lands, so a run of hours says where it has got to.
+func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 	var (
 		totalRefs, totalDangling, totalMissing, totalGaps int
 		hitStores                                         []string
+
+		scans   = make([]scan, len(names))
+		sem     = make(chan struct{}, max(jobs, 1))
+		stopped atomic.Bool
+		wg      sync.WaitGroup
 	)
-	for _, name := range names {
-		a, err := auditStore(db, name)
-		if err != nil {
-			return fmt.Errorf("audit store %s: %w", name, err)
+	// A scan still reading must not outlive the database it is reading, so an
+	// early return waits for whatever is in flight.
+	defer wg.Wait()
+	for i, name := range names {
+		s := &scans[i]
+		s.done = make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(s.done)
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// Nothing queued behind a failed store is worth reading, which is
+			// also what keeps -jobs 1 stopping exactly where it used to.
+			if stopped.Load() {
+				return
+			}
+			s.audit, s.err = auditStore(db, name)
+		}()
+	}
+
+	for i, name := range names {
+		<-scans[i].done
+		if scans[i].err != nil {
+			stopped.Store(true)
+			return fmt.Errorf("audit store %s: %w", name, scans[i].err)
 		}
+		a := scans[i].audit
 		dangling := a.danglingRefs()
 		totalRefs += a.refs
 		totalDangling += dangling

@@ -522,7 +522,7 @@ func TestAuditHealthy(t *testing.T) {
 		db, names := openFixture(t, dir)
 
 		out := captureStdout(t, func() {
-			if err := auditAll(db, names, 20); err != nil {
+			if err := auditAll(db, names, 20, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -545,7 +545,7 @@ func TestAuditFindsDamage(t *testing.T) {
 		db, names := openFixture(t, dir)
 
 		out := captureStdout(t, func() {
-			if err := auditAll(db, names, 20); err != nil {
+			if err := auditAll(db, names, 20, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -591,7 +591,7 @@ func TestAuditMultiVersion(t *testing.T) {
 		db, names := openFixture(t, clean)
 
 		out := captureStdout(t, func() {
-			if err := auditAll(db, names, 20); err != nil {
+			if err := auditAll(db, names, 20, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -639,7 +639,7 @@ func TestAuditMultiVersion(t *testing.T) {
 		db, names = openFixture(t, damaged)
 
 		out = captureStdout(t, func() {
-			if err := auditAll(db, names, 1000); err != nil {
+			if err := auditAll(db, names, 1000, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -656,6 +656,33 @@ func TestAuditMultiVersion(t *testing.T) {
 	})
 }
 
+// TestAuditParallel checks that -jobs changes only the order the scans run in,
+// not a character of the report: stores are still printed in their own order,
+// and a store scanned alongside another must reach the same verdict.
+func TestAuditParallel(t *testing.T) {
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		buildFixture(t, backend, dir, nodeKey{version: 1, nonce: 7})
+		db, names := openFixture(t, dir)
+
+		one := captureStdout(t, func() {
+			if err := auditAll(db, names, 20, 1); err != nil {
+				t.Fatal(err)
+			}
+		})
+		for _, jobs := range []int{0, 2, 8} {
+			many := captureStdout(t, func() {
+				if err := auditAll(db, names, 20, jobs); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if many != one {
+				t.Fatalf("-jobs %d changed the report:\n%s\nwant:\n%s", jobs, many, one)
+			}
+		}
+	})
+}
+
 // TestAuditMaxReport checks that truncation is stated rather than silent, and
 // that a negative -max-report holds every line back instead of panicking.
 func TestAuditMaxReport(t *testing.T) {
@@ -665,7 +692,7 @@ func TestAuditMaxReport(t *testing.T) {
 		db, names := openFixture(t, dir)
 
 		out := captureStdout(t, func() {
-			if err := auditAll(db, names, 1); err != nil {
+			if err := auditAll(db, names, 1, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -676,7 +703,7 @@ func TestAuditMaxReport(t *testing.T) {
 		}
 
 		out = captureStdout(t, func() {
-			if err := auditAll(db, names, -1); err != nil {
+			if err := auditAll(db, names, -1, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -764,7 +791,7 @@ func TestWalkToAndDelete(t *testing.T) {
 			t.Fatalf("walk after delete: %v", err)
 		}
 		out = captureStdout(t, func() {
-			if err := auditAll(db, []string{"evm"}, 5); err != nil {
+			if err := auditAll(db, []string{"evm"}, 5, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -833,7 +860,7 @@ func TestAuditFindsRootGap(t *testing.T) {
 
 		db, names := openFixture(t, dir)
 		out := captureStdout(t, func() {
-			if err := auditAll(db, names, 20); err != nil {
+			if err := auditAll(db, names, 20, 1); err != nil {
 				t.Fatal(err)
 			}
 		})
