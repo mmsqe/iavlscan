@@ -615,7 +615,8 @@ func TestAuditMultiVersion(t *testing.T) {
 	})
 }
 
-// TestAuditMaxReport checks that truncation is stated rather than silent.
+// TestAuditMaxReport checks that truncation is stated rather than silent, and
+// that a negative -max-report holds every line back instead of panicking.
 func TestAuditMaxReport(t *testing.T) {
 	eachBackend(t, func(t *testing.T, backend string) {
 		dir := t.TempDir()
@@ -628,6 +629,17 @@ func TestAuditMaxReport(t *testing.T) {
 			}
 		})
 		for _, want := range []string{"... and 1 more missing node(s) not printed", "2 dangling, 2 missing node(s)"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("output missing %q:\n%s", want, out)
+			}
+		}
+
+		out = captureStdout(t, func() {
+			if err := auditAll(db, names, -1); err != nil {
+				t.Fatal(err)
+			}
+		})
+		for _, want := range []string{"... and 2 more missing node(s) not printed", "2 dangling, 2 missing node(s)"} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("output missing %q:\n%s", want, out)
 			}

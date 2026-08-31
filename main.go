@@ -464,8 +464,10 @@ type storeAudit struct {
 	gaps     []versionRange
 }
 
-// report prints up to maxReport lines, then says how many it held back.
+// report prints up to maxReport lines, then says how many it held back. A
+// negative one holds them all back rather than slicing past the end.
 func report[T fmt.Stringer](items []T, maxReport int, what string) {
+	maxReport = max(maxReport, 0)
 	for _, it := range items[:min(len(items), maxReport)] {
 		fmt.Printf("      %s\n", it)
 	}
