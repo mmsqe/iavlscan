@@ -21,10 +21,11 @@ func (r versionRange) String() string {
 
 // storeAudit is what one store's pass found.
 type storeAudit struct {
-	nodes   int
-	refs    int
-	missing []missingNode // what the dangling references point at, oldest first
-	gaps    []versionRange
+	nodes        int
+	refs         int
+	missing      []missingNode // what the dangling references point at, oldest first
+	unreferenced []nodeKey     // non-root nodes no parent names: leaked garbage
+	gaps         []versionRange
 }
 
 // danglingRefs is how many references resolve to nothing. Each one is counted
@@ -79,6 +80,18 @@ func (p placed) String() string {
 		whereOf(p.db, p.store, p.first.parent))
 }
 
+// stranded is an unreferenced node ready to print. Reading its record costs a
+// read, so it happens in String, which report only calls for printed lines.
+type stranded struct {
+	nk    nodeKey
+	db    kvDB
+	store string
+}
+
+func (s stranded) String() string {
+	return fmt.Sprintf("%s is referenced by nothing; %s", s.nk, whereOf(s.db, s.store, s.nk))
+}
+
 // missingNodes collects dangling references by the node they point at. A parent
 // rewritten every block points at the same missing child once per version, so
 // this holds one entry per missing node rather than one per reference.
@@ -110,12 +123,13 @@ func (m missingNodes) sorted() []missingNode {
 
 // auditAll checks every reference in every store, so the damage can be read as
 // isolated (one bad prune decision) or widespread (bulk loss). It is disk
-// bound: one pass over every node, and 8 bytes of memory per node of each store
+// bound: one pass over every node, and 8 bytes plus a bit of memory per node
+// of each store
 // being scanned; -jobs stores are scanned at once.
 func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 	var (
-		totalRefs, totalDangling, totalMissing, totalGaps int
-		hitStores                                         []string
+		totalRefs, totalDangling, totalMissing, totalStranded, totalGaps int
+		hitStores                                                        []string
 	)
 	err := scanStores(names, jobs, func(name string) (storeAudit, error) {
 		a, err := auditStore(db, name)
@@ -128,10 +142,11 @@ func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 		totalRefs += a.refs
 		totalDangling += dangling
 		totalMissing += len(a.missing)
+		totalStranded += len(a.unreferenced)
 		totalGaps += len(a.gaps)
-		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%-9d missing=%-9d root gaps=%d\n",
-			name, a.nodes, a.refs, dangling, len(a.missing), len(a.gaps))
-		if len(a.missing) == 0 && len(a.gaps) == 0 {
+		fmt.Printf("  %-24s nodes=%-9d refs=%-9d dangling=%-9d missing=%-9d unreferenced=%-9d root gaps=%d\n",
+			name, a.nodes, a.refs, dangling, len(a.missing), len(a.unreferenced), len(a.gaps))
+		if len(a.missing) == 0 && len(a.unreferenced) == 0 && len(a.gaps) == 0 {
 			return nil
 		}
 		hitStores = append(hitStores, name)
@@ -143,14 +158,19 @@ func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 			lines[j] = placed{m, db, name}
 		}
 		report(lines, maxReport, "missing node(s)")
+		orphans := make([]stranded, len(a.unreferenced))
+		for j, nk := range a.unreferenced {
+			orphans[j] = stranded{nk, db, name}
+		}
+		report(orphans, maxReport, "unreferenced node(s)")
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("\nchecked %d references: %d dangling, %d missing node(s), %d root gap(s), %d store(s) affected\n",
-		totalRefs, totalDangling, totalMissing, totalGaps, len(hitStores))
+	fmt.Printf("\nchecked %d references: %d dangling, %d missing node(s), %d unreferenced node(s), %d root gap(s), %d store(s) affected\n",
+		totalRefs, totalDangling, totalMissing, totalStranded, totalGaps, len(hitStores))
 	if len(hitStores) == 0 {
 		fmt.Println("every reference resolves; this database is internally consistent")
 	} else {
@@ -175,7 +195,17 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 		pending []dangling // same-version references, checked once the version is complete
 		version int64
 		byNode  = missingNodes{}
+		named   bitset // one bit per index position: some parent names this node
 	)
+	// settle is a reference's verdict: mark the node it lands on, or record
+	// it as dangling.
+	settle := func(d dangling) {
+		if i, ok := index.find(d.ref.nk); ok {
+			named.set(i)
+		} else {
+			byNode.note(d)
+		}
+	}
 	// hasVersion and GetRoot both look only at nonce 1, so a version above
 	// the first one carrying it, but with none of its own, is a hole the
 	// pruner parks on, reporting "version does not exist". Nodes that outlive
@@ -184,9 +214,7 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 	var lastRoot int64
 	flush := func() {
 		for _, d := range pending {
-			if !index.resolves(d.ref.nk) {
-				byNode.note(d)
-			}
+			settle(d)
 		}
 		pending = pending[:0]
 	}
@@ -214,16 +242,24 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 		for _, r := range n.outgoing(buf) {
 			a.refs++
 			d := dangling{parent: parent, ref: r}
-			switch {
-			case r.nk.version >= parent.version:
+			if r.nk.version >= parent.version {
 				pending = append(pending, d)
-			case !index.resolves(r.nk):
-				byNode.note(d)
+			} else {
+				settle(d)
 			}
 		}
 		return nil
 	})
 	flush()
+
+	// The reverse check: every node past the roots must be some parent's
+	// child. A failed prune leaves subtrees no root reaches; this finds their
+	// tops, while what hangs below stays referenced by the garbage above it.
+	for i := 0; i < index.n; i++ {
+		if nk := index.at(i); !named.has(i) && nk.nonce > 1 {
+			a.unreferenced = append(a.unreferenced, nk)
+		}
+	}
 	a.nodes, a.missing = index.n, byNode.sorted()
 	return a, err
 }
@@ -254,25 +290,51 @@ func (x *nodeIndex) add(packed uint64) {
 	x.n++
 }
 
-// holds reports whether the index has this node key: one search for the block
+// pos is the position of a node key in the index: one search for the block
 // whose last key is the first not below it, then one search inside that block.
-func (x *nodeIndex) holds(nk nodeKey) bool {
+func (x *nodeIndex) pos(nk nodeKey) (int, bool) {
 	packed, ok := packNodeKey(nk)
 	if !ok {
-		return false // nothing in the index can match an impossible key
+		return 0, false // nothing in the index can match an impossible key
 	}
 	i, _ := slices.BinarySearch(x.tails, packed)
 	if i == len(x.blocks) {
-		return false
+		return 0, false
 	}
-	_, found := slices.BinarySearch(x.blocks[i], packed)
-	return found
+	j, found := slices.BinarySearch(x.blocks[i], packed)
+	return i*indexBlock + j, found
 }
 
-// resolves reports whether a reference finds a node, mirroring nodeDB.GetNode:
-// a missing key whose nonce is 1 falls back to (version, 0), the reformatted
-// root deleteVersion leaves behind. Without that fallback every pruned root
-// would look dangling.
-func (x *nodeIndex) resolves(nk nodeKey) bool {
-	return x.holds(nk) || (nk.nonce == 1 && x.holds(nodeKey{version: nk.version}))
+// at is the node key at one position, every block being full but the last.
+func (x *nodeIndex) at(i int) nodeKey {
+	return unpackNodeKey(x.blocks[i/indexBlock][i%indexBlock])
+}
+
+// bitset is one bit per index position, grown as it is set.
+type bitset []uint64
+
+func (b *bitset) set(i int) {
+	for w := i >> 6; len(*b) <= w; {
+		*b = append(*b, 0)
+	}
+	(*b)[i>>6] |= 1 << (i & 63)
+}
+
+func (b bitset) has(i int) bool {
+	w := i >> 6
+	return w < len(b) && b[w]&(1<<(i&63)) != 0
+}
+
+// find is where a reference lands, mirroring nodeDB.GetNode: a missing key
+// whose nonce is 1 falls back to (version, 0), the reformatted root
+// deleteVersion leaves behind. Without that fallback every pruned root would
+// look dangling.
+func (x *nodeIndex) find(nk nodeKey) (int, bool) {
+	if i, ok := x.pos(nk); ok {
+		return i, true
+	}
+	if nk.nonce == 1 {
+		return x.pos(nodeKey{version: nk.version})
+	}
+	return 0, false
 }

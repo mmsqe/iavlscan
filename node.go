@@ -95,6 +95,10 @@ func packNodeKey(nk nodeKey) (uint64, bool) {
 	return uint64(nk.version)<<32 | uint64(uint32(nk.nonce)), true //nolint:gosec // nonce is checked non-negative
 }
 
+func unpackNodeKey(packed uint64) nodeKey {
+	return nodeKey{version: int64(packed >> 32), nonce: int32(packed)} //nolint:gosec // inverts packNodeKey
+}
+
 // child is one of an inner node's two links, either a node key or, for a node
 // carried over from the legacy format, a hash.
 type child struct {

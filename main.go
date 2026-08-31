@@ -31,7 +31,7 @@ func run() error {
 	var (
 		dbPath = flag.String("db", "", "path to application.db")
 		rawKey = flag.String("nodekey", "", "find the parents of this node; hex as printed in the error")
-		audit  = flag.Bool("audit", false, "check every reference in every store, reporting dangling ones")
+		audit  = flag.Bool("audit", false, "check every store both ways: dangling references, and nodes no parent names")
 		maxRep = flag.Int("max-report", 20, "with -audit, dangling references to print per store")
 		jobs   = flag.Int("jobs", 1, "stores to scan at once for -audit and -nodekey; each -audit job holds its own node index in memory")
 		list   = flag.Bool("list", false, "print each store's node key range")

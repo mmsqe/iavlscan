@@ -491,28 +491,35 @@ func TestNodeIndex(t *testing.T) {
 	if x.n != len(keys) || len(x.blocks) != 4 {
 		t.Fatalf("index holds %d keys in %d blocks, want %d in 4", x.n, len(x.blocks), len(keys))
 	}
-	for _, nk := range keys {
-		if !x.holds(nk) {
-			t.Fatalf("%v was added but is not held", nk)
+	for want, nk := range keys {
+		got, ok := x.pos(nk)
+		if !ok || got != want {
+			t.Fatalf("pos(%v) = %d,%v, want %d", nk, got, ok, want)
+		}
+		if back := x.at(want); back != nk {
+			t.Fatalf("at(%d) = %v, want %v", want, back, nk)
 		}
 		// The nonces between and beyond the two stored per version were never
 		// added, and a two-level search must not find them either.
 		for _, absent := range []int32{nk.nonce - 1, nk.nonce + 1} {
-			if absent > 0 && x.holds(nodeKey{version: nk.version, nonce: absent}) {
-				t.Fatalf("(v%d,n%d) was never added but is held", nk.version, absent)
+			if absent > 0 {
+				if _, ok := x.pos(nodeKey{version: nk.version, nonce: absent}); ok {
+					t.Fatalf("(v%d,n%d) was never added but is held", nk.version, absent)
+				}
 			}
 		}
 	}
-	if last := keys[len(keys)-1]; x.holds(nodeKey{version: last.version + 1, nonce: 1}) {
+	if _, ok := x.pos(nodeKey{version: keys[len(keys)-1].version + 1, nonce: 1}); ok {
 		t.Fatal("a key past the end of the last block is held")
 	}
-	if x.holds(nodeKey{version: 1, nonce: 0}) {
+	if _, ok := x.pos(nodeKey{version: 1, nonce: 0}); ok {
 		t.Fatal("a key before the start of the first block is held")
 	}
 }
 
-// TestResolves covers nodeDB.GetNode's fallback: pruning rewrites a root from
-// (v,1) to (v,0), and references to it must still resolve.
+// TestResolves covers nodeDB.GetNode's fallback in find: pruning rewrites a
+// root from
+// (v,1) to (v,0), and references to it must still land.
 func TestResolves(t *testing.T) {
 	// Version 5's root was reformatted to nonce 0; version 9 was never stored.
 	x := index(t, nodeKey{version: 5}, nodeKey{version: 7, nonce: 1}, nodeKey{version: 7, nonce: 42})
@@ -529,8 +536,8 @@ func TestResolves(t *testing.T) {
 		{nodeKey{version: 5, nonce: 2}, false, "only nonce 1 gets the fallback"},
 		{nodeKey{version: -1, nonce: 1}, false, "an impossible key matches nothing"},
 	} {
-		if got := x.resolves(tc.nk); got != tc.want {
-			t.Fatalf("resolves(%v) = %v, want %v (%s)", tc.nk, got, tc.want, tc.why)
+		if _, got := x.find(tc.nk); got != tc.want {
+			t.Fatalf("find(%v) = %v, want %v (%s)", tc.nk, got, tc.want, tc.why)
 		}
 	}
 }
@@ -548,7 +555,7 @@ func TestAuditHealthy(t *testing.T) {
 		})
 		// 2 stores x 299 inner nodes x 2 children.
 		for _, want := range []string{
-			"checked 1196 references: 0 dangling, 0 missing node(s), 0 root gap(s), 0 store(s) affected",
+			"checked 1196 references: 0 dangling, 0 missing node(s), 0 unreferenced node(s), 0 root gap(s), 0 store(s) affected",
 			"internally consistent",
 		} {
 			if !strings.Contains(out, want) {
@@ -570,10 +577,14 @@ func TestAuditFindsDamage(t *testing.T) {
 			}
 		})
 		// The removed node was referenced once, by its parent in evm only; bank
-		// holds a node with the same key and must stay clean.
+		// holds a node with the same key and must stay clean. (v1,n7) is an
+		// inner node, so the deletion also strands its two children: nothing
+		// names them any more, and the audit has to say so.
 		for _, want := range []string{
 			"(v1,n7) is missing: 1 reference(s) from parents v1..v1; ",
-			"1 dangling, 1 missing node(s), 0 root gap(s), 1 store(s) affected",
+			"(v1,n8) is referenced by nothing; ",
+			"(v1,n11) is referenced by nothing; ",
+			"1 dangling, 1 missing node(s), 2 unreferenced node(s), 0 root gap(s), 1 store(s) affected",
 			"affected stores: evm",
 		} {
 			if !strings.Contains(out, want) {
@@ -615,8 +626,10 @@ func TestAuditMultiVersion(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
-		if !strings.Contains(out, "0 dangling") {
-			t.Fatalf("clean tree audited dirty:\n%s", out)
+		for _, want := range []string{"0 dangling", "0 unreferenced node(s)"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("clean tree audited dirty (missing %q):\n%s", want, out)
+			}
 		}
 
 		// Pick one child of each kind and count how many parents reference each,
@@ -663,7 +676,7 @@ func TestAuditMultiVersion(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
-		want := fmt.Sprintf("%d dangling, 2 missing node(s), 0 root gap(s), 1 store(s) affected", count[older]+count[same])
+		want := fmt.Sprintf("%d dangling, 2 missing node(s)", count[older]+count[same])
 		for _, w := range []string{
 			want,
 			fmt.Sprintf("%v is missing: %d reference(s)", older, count[older]),
@@ -881,6 +894,59 @@ func TestWalkToRefRootChain(t *testing.T) {
 	})
 }
 
+// TestAuditPrunedStoreIsClean: a store pruned by iavl itself must audit
+// clean. Pruning leaves reformatted (v,0) roots behind, and a no-change
+// version leaves a reference root; none of them may read as dangling,
+// missing or unreferenced.
+func TestAuditPrunedStoreIsClean(t *testing.T) {
+	eachBackend(t, func(t *testing.T, backend string) {
+		dir := t.TempDir()
+		db := newFixtureDB(t, backend, dir)
+		pdb := dbm.NewPrefixDB(db, []byte(rootPrefix+"evm/"))
+		tree := iavl.NewMutableTree(iavldb.NewWrapper(pdb), 0, false, iavl.NewNopLogger())
+		save := func() {
+			if _, _, err := tree.SaveVersion(); err != nil {
+				t.Fatalf("save: %v", err)
+			}
+		}
+		for v := range 30 {
+			for i := range 10 {
+				if _, err := tree.Set(fmt.Appendf(nil, "key%03d", (v*7+i)%60), []byte{byte(v)}); err != nil {
+					t.Fatalf("set: %v", err)
+				}
+			}
+			save()
+			if v == 9 {
+				save() // a version that changed nothing: a reference root
+			}
+		}
+		if err := tree.DeleteVersionsTo(20); err != nil {
+			t.Fatalf("prune: %v", err)
+		}
+		// One more version, whose save writes the staged deletes out.
+		if _, err := tree.Set([]byte("key000"), []byte("last")); err != nil {
+			t.Fatal(err)
+		}
+		save()
+		db.Close()
+
+		db2, names := openFixture(t, dir)
+		out := captureStdout(t, func() {
+			if err := auditAll(db2, names, 20, 1); err != nil {
+				t.Fatal(err)
+			}
+		})
+		for _, want := range []string{
+			"0 dangling, 0 missing node(s), 0 unreferenced node(s), 0 root gap(s), 0 store(s) affected",
+			"internally consistent",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("pruned store audited dirty (missing %q):\n%s", want, out)
+			}
+		}
+	})
+}
+
 // TestAuditFindsRootGap covers what the reference check cannot see: a root
 // record is an entry point, not anyone's child, so deleting one leaves no
 // dangling reference -- only a hole in the versions, which is what parks the
@@ -911,7 +977,14 @@ func TestAuditFindsRootGap(t *testing.T) {
 			}
 		})
 		// A store with only a gap must still be named as affected.
-		for _, want := range []string{"no root record for version 6", "1 root gap(s)", "affected stores: evm"} {
+		// The deleted root also strands its own children: it was rewritten at
+		// version 6, so at least one child is a v6 node with no other parent.
+		for _, want := range []string{
+			"no root record for version 6",
+			"1 root gap(s)",
+			"is referenced by nothing",
+			"affected stores: evm",
+		} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("output missing %q:\n%s", want, out)
 			}
