@@ -258,7 +258,8 @@ func eachNode(db kvDB, store string, from nodeKey, fn func(nodeKey, []byte) erro
 
 	// A mainnet store takes hours, so report the rate every so often.
 	var seen int
-	start, last := time.Now(), time.Now()
+	start := time.Now()
+	last := start
 	for ok := it.First(); ok; ok = it.Next() {
 		k := it.Key()
 		if len(k) != len(prefix)+nodeKeyLen {

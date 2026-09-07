@@ -54,7 +54,9 @@ written either way, so the node is unaffected, but a compaction can remove a
 file under the scan and fail it. `-audit` and `-nodekey` read every node once
 and are disk bound, so on a mainnet database expect hours. `-jobs` scans that
 many stores at once, which is what shortens both; an `-audit` job also holds
-8 bytes of memory per node of its store.
+8 bytes of memory per node of its store, plus 12 per reference within the
+version it is reading, which on a store state sync wrote at one version is
+every reference.
 
 `-audit` is the one to start with:
 

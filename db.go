@@ -1,5 +1,5 @@
-// application.db is pebble or goleveldb, and the IAVL layout above it is the
-// same either way. This file is the only place that knows which: everything
+// application.db is pebble, goleveldb or rocksdb, and the IAVL layout above it
+// is the same in each. Which one is settled here and in rocksdb.go: everything
 // else works through kvDB.
 package main
 
@@ -54,7 +54,7 @@ type kvDB interface {
 }
 
 // kvIter is a cursor over one key range. Key and Value are only valid until
-// the next move, as they are in both backends.
+// the next move, as they are in every backend.
 type kvIter interface {
 	First() bool
 	Last() bool

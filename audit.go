@@ -92,6 +92,15 @@ func (s stranded) String() string {
 	return fmt.Sprintf("%s is referenced by nothing; %s", s.nk, whereOf(s.db, s.store, s.nk))
 }
 
+// sameVersionRef is a reference waiting for its version to finish: parent and
+// child nonce, the version being the one under scan. Twelve bytes against
+// dangling's forty matter because a state-synced store writes its whole tree
+// at one version, so every reference it holds waits here at once.
+type sameVersionRef struct {
+	parent, child int32
+	side          side
+}
+
 // missingNodes collects dangling references by the node they point at. A parent
 // rewritten every block points at the same missing child once per version, so
 // this holds one entry per missing node rather than one per reference.
@@ -123,9 +132,9 @@ func (m missingNodes) sorted() []missingNode {
 
 // auditAll checks every reference in every store, so the damage can be read as
 // isolated (one bad prune decision) or widespread (bulk loss). It is disk
-// bound: one pass over every node, and 8 bytes plus a bit of memory per node
-// of each store
-// being scanned; -jobs stores are scanned at once.
+// bound: one pass over every node, and 8 bytes of memory per node of each
+// store being scanned, plus 12 per reference of the version under scan; -jobs
+// stores are scanned at once.
 func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 	var (
 		totalRefs, totalDangling, totalMissing, totalStranded, totalGaps int
@@ -192,7 +201,7 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 	var (
 		index   nodeIndex
 		buf     = make([]reference, 0, 2)
-		pending []dangling // same-version references, checked once the version is complete
+		pending []sameVersionRef // checked once the version is complete
 		version int64
 		byNode  = missingNodes{}
 		named   bitset // one bit per index position: some parent names this node
@@ -213,8 +222,11 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 	// versions still share.
 	var lastRoot int64
 	flush := func() {
-		for _, d := range pending {
-			settle(d)
+		for _, p := range pending {
+			settle(dangling{
+				parent: nodeKey{version, p.parent},
+				ref:    reference{nodeKey{version, p.child}, p.side},
+			})
 		}
 		pending = pending[:0]
 	}
@@ -241,11 +253,13 @@ func auditStore(db kvDB, store string) (a storeAudit, err error) {
 		}
 		for _, r := range n.outgoing(buf) {
 			a.refs++
-			d := dangling{parent: parent, ref: r}
-			if r.nk.version >= parent.version {
-				pending = append(pending, d)
+			if r.nk.version == parent.version {
+				pending = append(pending, sameVersionRef{parent.nonce, r.nk.nonce, r.side})
 			} else {
-				settle(d)
+				// An older child is indexed already; a newer one is not its
+				// child at all, and waiting for the version to end would not
+				// bring it into the index either.
+				settle(dangling{parent: parent, ref: r})
 			}
 		}
 		return nil

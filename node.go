@@ -114,10 +114,30 @@ func (c child) String() string {
 	return fmt.Sprintf("%-16v %s", c.nk, c.nk.find())
 }
 
-// reference is one outgoing link, named by which side it came from.
+// side names which link of a record a reference came from.
+type side uint8
+
+const (
+	leftChild side = iota
+	rightChild
+	referenceTo
+)
+
+func (s side) String() string {
+	switch s {
+	case leftChild:
+		return "left child"
+	case rightChild:
+		return "right child"
+	}
+	return "reference to"
+}
+
+// reference is one outgoing link by node key, named by which side it came
+// from. A legacy child has no node key, so it never becomes one.
 type reference struct {
-	child
-	side string
+	nk   nodeKey
+	side side
 }
 
 // node is one decoded IAVL record. Leaves carry key and value, inner nodes key,
@@ -144,13 +164,13 @@ func (n node) outgoing(buf []reference) []reference {
 	buf = buf[:0]
 	switch {
 	case n.ref:
-		buf = append(buf, reference{child{nk: n.refTo}, "reference to"})
+		buf = append(buf, reference{n.refTo, referenceTo})
 	case !n.leaf && !n.empty:
 		if !n.left.legacy {
-			buf = append(buf, reference{n.left, "left child"})
+			buf = append(buf, reference{n.left.nk, leftChild})
 		}
 		if !n.right.legacy {
-			buf = append(buf, reference{n.right, "right child"})
+			buf = append(buf, reference{n.right.nk, rightChild})
 		}
 	}
 	return buf

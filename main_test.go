@@ -518,8 +518,7 @@ func TestNodeIndex(t *testing.T) {
 }
 
 // TestResolves covers nodeDB.GetNode's fallback in find: pruning rewrites a
-// root from
-// (v,1) to (v,0), and references to it must still land.
+// root from (v,1) to (v,0), and references to it must still land.
 func TestResolves(t *testing.T) {
 	// Version 5's root was reformatted to nonce 0; version 9 was never stored.
 	x := index(t, nodeKey{version: 5}, nodeKey{version: 7, nonce: 1}, nodeKey{version: 7, nonce: 42})
