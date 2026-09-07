@@ -38,15 +38,16 @@ func (a storeAudit) danglingRefs() int {
 	return n
 }
 
-// report prints up to maxReport lines, then says how many it held back. A
-// negative one holds them all back rather than slicing past the end.
-func report[T fmt.Stringer](items []T, maxReport int, what string) {
+// report prints up to maxReport of n lines, then says how many it held back.
+// A negative maxReport holds them all back. line is called only for the lines
+// printed, so it is where a read that places the record belongs.
+func report(n, maxReport int, what string, line func(i int) string) {
 	maxReport = max(maxReport, 0)
-	for _, it := range items[:min(len(items), maxReport)] {
-		fmt.Printf("      %s\n", it)
+	for i := range min(n, maxReport) {
+		fmt.Printf("      %s\n", line(i))
 	}
-	if n := len(items) - maxReport; n > 0 {
-		fmt.Printf("      ... and %d more %s not printed (raise -max-report to see them)\n", n, what)
+	if rest := n - maxReport; rest > 0 {
+		fmt.Printf("      ... and %d more %s not printed (raise -max-report to see them)\n", rest, what)
 	}
 }
 
@@ -64,32 +65,6 @@ type missingNode struct {
 	first dangling
 	last  int64
 	refs  int
-}
-
-// placed is a missing node ready to print. Locating the parent costs a read,
-// so it happens in String, which report only calls for the lines it prints.
-type placed struct {
-	missingNode
-	db    kvDB
-	store string
-}
-
-func (p placed) String() string {
-	return fmt.Sprintf("%s is missing: %d reference(s) from parents v%d..v%d; %s of %s, %s",
-		p.nk, p.refs, p.first.parent.version, p.last, p.first.ref.side, p.first.parent,
-		whereOf(p.db, p.store, p.first.parent))
-}
-
-// stranded is an unreferenced node ready to print. Reading its record costs a
-// read, so it happens in String, which report only calls for printed lines.
-type stranded struct {
-	nk    nodeKey
-	db    kvDB
-	store string
-}
-
-func (s stranded) String() string {
-	return fmt.Sprintf("%s is referenced by nothing; %s", s.nk, whereOf(s.db, s.store, s.nk))
 }
 
 // sameVersionRef is a reference waiting for its version to finish: parent and
@@ -161,17 +136,19 @@ func auditAll(db kvDB, names []string, maxReport, jobs int) error {
 		hitStores = append(hitStores, name)
 		// Nothing references a root, so the reference check cannot see one go
 		// missing; a gap is what parks the pruner on "version does not exist".
-		report(a.gaps, maxReport, "root gap(s)")
-		lines := make([]placed, len(a.missing))
-		for j, m := range a.missing {
-			lines[j] = placed{m, db, name}
-		}
-		report(lines, maxReport, "missing node(s)")
-		orphans := make([]stranded, len(a.unreferenced))
-		for j, nk := range a.unreferenced {
-			orphans[j] = stranded{nk, db, name}
-		}
-		report(orphans, maxReport, "unreferenced node(s)")
+		report(len(a.gaps), maxReport, "root gap(s)", func(i int) string {
+			return a.gaps[i].String()
+		})
+		report(len(a.missing), maxReport, "missing node(s)", func(i int) string {
+			m := a.missing[i]
+			return fmt.Sprintf("%s is missing: %d reference(s) from parents v%d..v%d; %s of %s, %s",
+				m.nk, m.refs, m.first.parent.version, m.last, m.first.ref.side, m.first.parent,
+				whereOf(db, name, m.first.parent))
+		})
+		report(len(a.unreferenced), maxReport, "unreferenced node(s)", func(i int) string {
+			nk := a.unreferenced[i]
+			return fmt.Sprintf("%s is referenced by nothing; %s", nk, whereOf(db, name, nk))
+		})
 		return nil
 	})
 	if err != nil {
